@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+env/
+venv/
+.venv/
+*.egg
+*.egg-info/
+dist/
+build/
+
+# PyCharm
+.idea/
+*.iml
+*.ipr
+*.iws
+
+# Streamlit
+.streamlit/
+
+# Outros
+.DS_Store
+.vscode/
+*.log
+*.txt
+*.zip
+*.rar
+*.tar.gz
+
+# Arquivos de dados temporários ou sensíveis (se aplicável)
+# config.py  # Descomente esta linha se quiser IGNORAR o config.py

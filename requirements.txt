@@ -9,3 +9,7 @@ langchain-community
 langchain-experimental
 supabase
 streamlit-authenticator
+SQLAlchemy
+tabulate
+pandasql
+openpyxl

@@ -13,3 +13,4 @@ SQLAlchemy
 tabulate
 pandasql
 openpyxl
+cryptography

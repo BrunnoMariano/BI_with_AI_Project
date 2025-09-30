@@ -101,34 +101,41 @@ def generate_suggestions(client, model_name, schema_text, question):
 
 # --- FUNÇÕES DO DASHBOARD ---
 def generate_chart_instructions(client, model_name, schema_text, question, db_mode, df_preview=None):
-    """Pede instruções de gráfico para a IA, adaptando-se ao dialeto do banco."""
+    """Pede instruções de gráfico para a IA, com hierarquia de regras."""
     preview_text = df_preview.head(5).to_markdown(
         index=False) if df_preview is not None and not df_preview.empty else ""
 
     if db_mode:
-        dialect_instructions = (
-            "3. A consulta deve ser compatível com o dialeto PostgreSQL.\n"
-            "4. Para agrupar por mês, use a função `to_char(\"nome_da_coluna_data\", 'YYYY-MM')`."
-        )
+        dialect_instructions = "3. A consulta deve ser compatível com o dialeto PostgreSQL.\n4. Para agrupar por mês, use a função `to_char(\"nome_da_coluna_data\", 'YYYY-MM')`."
     else:  # Modo Arquivo (pandasql/SQLite)
-        dialect_instructions = (
-            "3. A consulta deve ser compatível com o dialeto SQLite.\n"
-            "4. Para agrupar por mês, use a função `strftime('%Y-%m', \"nome_da_coluna_data\")`."
-        )
+        dialect_instructions = "3. A consulta deve ser compatível com o dialeto SQLite.\n4. Para agrupar por mês, use a função `strftime('%Y-%m', \"nome_da_coluna_data\")`."
 
     system_content = (
-            "Você é um assistente que cria dashboards gerando uma consulta SQL e sua configuração.\n"
-            "REGRAS CRÍTICAS:\n"
-            "1. Use EXCLUSIVAMENTE os nomes de colunas fornecidos no esquema.\n"
+            "Você é uma especialista sênior em visualização de dados. Sua missão é traduzir o pedido do usuário em uma configuração de gráfico completa e precisa.\n"
+            "\n--- HIERARQUIA DE REGRAS ---\n"
+            "1. **PRIORIDADE MÁXIMA: OBEDECER AO USUÁRIO.** Se o usuário pedir um tipo de gráfico específico (ex: 'gráfico de pizza', 'gráfico de barras'), VOCÊ DEVE usar esse tipo no campo 'Tipo'. Não mude a escolha dele.\n"
+            "2. **MODO ESPECIALISTA (FALLBACK):** SOMENTE SE o pedido for vago ou não especificar um tipo de gráfico, use sua expertise para escolher a melhor visualização, seguindo as diretrizes abaixo:\n"
+            "   - Para comparações entre categorias -> use 'bar'.\n"
+            "   - Para tendências ao longo do tempo -> use 'line'.\n"
+            "   - Para a relação entre duas variáveis numéricas -> use 'scatter'.\n"
+            "   - Para a distribuição de uma variável -> use 'histogram'.\n"
+            "   - Para composição de um todo -> use 'pie'.\n"
+            "\nREGRAS CRÍTICAS DE SINTAXE SQL:\n"
+            "1. Use EXCLUSIVAMENTE os nomes de colunas fornecidos no esquema. NÃO INVENTE nomes de colunas.\n"
             "2. Se um nome de coluna contiver espaços ou caracteres especiais, você DEVE envolvê-lo em aspas duplas (ex: `\"Receita Total (R$)\"`).\n"
             + dialect_instructions +
-            "\n5. Retorne a resposta APENAS no formato especificado abaixo, sem nenhuma outra explicação.\n"
+            "\nREGRAS CRÍTICAS DE SAÍDA:\n"
+            "1. Gere um título inteligente e descritivo que corresponda ao pedido do usuário.\n"
+            "2. Se apropriado e se adicionar valor, use o parâmetro 'Color' para incluir uma dimensão extra na análise.\n"
+            "3. Retorne a resposta APENAS no formato especificado abaixo, sem nenhuma outra explicação.\n"
             "\n--- FORMATO OBRIGATÓRIO ---\n"
-            "SQL: <query>\n"
-            "Tipo: <bar|line|pie>\n"
+            "SQL: <query SQL para extrair os dados>\n"
+            "Tipo: <bar|line|pie|scatter|histogram|area>\n"
             "X: <coluna para o eixo X>\n"
             "Y: <coluna para o eixo Y>\n"
-            "Título: <título para o gráfico>"
+            "Color: <(opcional) coluna para as cores>\n"
+            "Título: <título descritivo do gráfico>\n"
+            "Justificativa: <(opcional) por que este é o melhor gráfico para o pedido>"
     )
 
     messages = [{"role": "system", "content": system_content}, {"role": "user",
@@ -138,7 +145,8 @@ def generate_chart_instructions(client, model_name, schema_text, question, db_mo
 
 
 def parse_chart_instructions(text):
-    chart = {"sql": None, "type": "bar", "x": None, "y": None, "title": "Gráfico"}
+    """Extrai SQL, tipo, eixos e título da resposta da IA."""
+    chart = {"sql": None, "type": "bar", "x": None, "y": None, "color": None, "title": "Gráfico"}
     for line in text.splitlines():
         if line.strip().lower().startswith("sql:"):
             chart["sql"] = line.split(":", 1)[1].strip()
@@ -148,32 +156,49 @@ def parse_chart_instructions(text):
             chart["x"] = line.split(":", 1)[1].strip()
         elif line.strip().lower().startswith("y:"):
             chart["y"] = line.split(":", 1)[1].strip()
+        elif line.strip().lower().startswith("color:"):
+            chart["color"] = line.split(":", 1)[1].strip()
         elif line.strip().lower().startswith("título:") or line.strip().lower().startswith("titulo:"):
             chart["title"] = line.split(":", 1)[1].strip()
     return chart
 
 
 def _strip_quotes(val: str):
+    """Remove aspas extras de nomes de colunas."""
     if not isinstance(val, str): return val
     return val.strip().strip('"').strip("'")
 
 
 def render_chart(chart_config):
+    """Renderiza gráfico Plotly."""
     df = chart_config.get("df", pd.DataFrame())
     if df is None or df.empty: st.warning("Sem dados para exibir neste gráfico."); return
-    tipo = chart_config.get("type", "bar");
-    x = _strip_quotes(chart_config.get("x")) if chart_config.get("x") else None;
+
+    tipo = chart_config.get("type", "bar")
+    x = _strip_quotes(chart_config.get("x")) if chart_config.get("x") else None
     y = _strip_quotes(chart_config.get("y")) if chart_config.get("y") else None
+    color = _strip_quotes(chart_config.get("color")) if chart_config.get("color") else None
+
     if x and x not in df.columns: st.error(f"Eixo X inválido '{x}'. Colunas: {list(df.columns)}"); return
-    if y and y not in df.columns and tipo != "pie": st.error(
+    if y and y not in df.columns and tipo not in ["pie", "histogram"]: st.error(
         f"Eixo Y inválido '{y}'. Colunas: {list(df.columns)}"); return
+    if color and color not in df.columns: st.error(
+        f"Coluna de cor inválida '{color}'. Colunas: {list(df.columns)}"); return
+
     try:
+        title = chart_config.get("title", "Gráfico")
         if tipo == "bar":
-            fig = px.bar(df, x=x, y=y, title=chart_config.get("title", "Gráfico"))
+            fig = px.bar(df, x=x, y=y, color=color, title=title)
         elif tipo == "line":
-            fig = px.line(df, x=x, y=y, title=chart_config.get("title", "Gráfico"))
+            fig = px.line(df, x=x, y=y, color=color, title=title)
         elif tipo == "pie":
-            fig = px.pie(df, names=x, values=y, title=chart_config.get("title", "Gráfico"))
+            fig = px.pie(df, names=x, values=y, color=color, title=title)
+        elif tipo == "scatter":
+            fig = px.scatter(df, x=x, y=y, color=color, title=title)
+        elif tipo == "histogram":
+            fig = px.histogram(df, x=x, y=y, color=color, title=title)
+        elif tipo == "area":
+            fig = px.area(df, x=x, y=y, color=color, title=title)
         else:
             st.warning(f"Tipo de gráfico '{tipo}' não suportado."); return
         st.plotly_chart(fig, use_container_width=True)
@@ -296,6 +321,7 @@ else:
                 st.session_state.history.append({"role": "user", "content": prompt})
                 with st.chat_message("user"):
                     st.markdown(prompt)
+
                 with st.chat_message("assistant"):
                     with st.spinner("Analisando..."):
                         if (db_mode and schema_text == "(sem esquema)") or (not db_mode and df_data is None):

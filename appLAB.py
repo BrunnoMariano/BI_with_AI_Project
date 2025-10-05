@@ -18,7 +18,6 @@ st.set_page_config(page_title="Plataforma de Dados", layout="wide")
 # ----------------------
 
 def build_history_text(history, max_turns=6):
-    """Converte histórico em texto compacto para enviar à IA."""
     if not history: return ""
     max_messages = max_turns * 2;
     recent = history[-max_messages:]
@@ -28,7 +27,6 @@ def build_history_text(history, max_turns=6):
 
 
 def extract_sql(text: str) -> str:
-    """Extrai SQL de um texto."""
     if not text: return ""
     m = re.search(r"```(?:sql)?\s*(.*?)```", text, re.S | re.I)
     if m: return m.group(1).strip()
@@ -38,7 +36,6 @@ def extract_sql(text: str) -> str:
 
 
 def describe_dataframe_schema(df: pd.DataFrame) -> str:
-    """Retorna esquema textual de um DataFrame."""
     lines = [f"A tabela se chama 'df' e possui as seguintes colunas:"]
     for col in df.columns: lines.append(f'- "{col}" (tipo: {str(df[col].dtype)})')
     return "\n".join(lines)
@@ -47,42 +44,39 @@ def describe_dataframe_schema(df: pd.DataFrame) -> str:
 # --- FUNÇÕES DE IA ESPECIALIZADAS ---
 
 def classify_intent(client, model_name, question, history_text):
-    """Classifica a intenção do usuário em uma de três categorias."""
+    """Classifica a intenção do usuário em uma de quatro categorias."""
     system_prompt = (
-        "Você é um especialista em interpretar a intenção do usuário. Classifique a pergunta do usuário em uma das seguintes categorias:\n"
-        "- `data_query`: O usuário está pedindo por dados específicos, totais, médias, listas ou qualquer análise que exija uma consulta SQL.\n"
-        "- `schema_info`: O usuário está perguntando sobre a estrutura dos dados, como 'quais tabelas existem?', 'descreva a tabela X', 'quais as colunas da tabela Y?'.\n"
-        "- `suggestion_request`: O usuário está pedindo sugestões, ideias, ou fazendo uma pergunta geral/aberta (ex: 'olá', 'o que posso perguntar?', 'me ajude').\n"
-        "Responda APENAS com a categoria, nada mais."
+        "Você é um especialista em interpretar a intenção do usuário. Classifique a pergunta em uma das categorias:\n"
+        "- `data_query`: Pedido de dados específicos, totais, médias, que exija uma consulta SQL.\n"
+        "- `schema_info`: Pedido sobre a estrutura dos dados ('quais tabelas existem?', 'descreva a tabela X').\n"
+        "- `schema_summary`: Pedido de uma explicação ou resumo sobre o propósito do banco de dados ('o que é esse banco?', 'qual o contexto dos dados?').\n"
+        "- `suggestion_request`: Pedido de sugestões, ideias, ou uma pergunta geral/aberta ('olá', 'me ajude').\n"
+        "Responda APENAS com a categoria."
     )
-    messages = [
-        {"role": "system", "content": system_prompt},
-        {"role": "user", "content": f"Histórico da conversa:\n{history_text}\n\nPergunta do usuário:\n{question}"}
-    ]
+    messages = [{"role": "system", "content": system_prompt},
+                {"role": "user", "content": f"Histórico:\n{history_text}\n\nPergunta do usuário:\n{question}"}]
     try:
         resp = client.chat.completions.create(model=model_name, messages=messages, temperature=0.0, max_tokens=20)
         return resp.choices[0].message.content.strip().lower().replace('`', '')
     except Exception:
-        return 'data_query'  # Default seguro
+        return 'data_query'
 
 
 def generate_sql(client, model_name, system_prompt, schema_text, history_text, question):
-    """Função genérica para pedir SQL à OpenAI."""
-    messages = [{"role": "system", "content": system_prompt + "\n\n---\nEsquema dos Dados:\n" + schema_text},
+    messages = [{"role": "system", "content": system_prompt + "\n\n---\nEsquema:\n" + schema_text},
                 {"role": "user", "content": f"Histórico:\n{history_text or '(vazio)'}\n\nPergunta:\n{question}"}]
     resp = client.chat.completions.create(model=model_name, messages=messages, temperature=0.0, max_tokens=800)
     return resp.choices[0].message.content.strip()
 
 
 def generate_humanized_answer(client, model_name, question, df_result, sql_text=None, show_sql=False):
-    """Gera resposta humanizada. Inclui SQL apenas se show_sql=True."""
     preview_text = df_result.head(10).to_markdown(
         index=False) if df_result is not None and not df_result.empty else "(A consulta não retornou dados)"
-    system_prompt = "Você é um assistente de BI que explica resultados de forma clara e amigável para um usuário de negócios.\nSua resposta DEVE ser estruturada e informativa. Use tópicos, negrito e tabelas em markdown."
-    user_content = f"Com base na pergunta '{question}' e nos dados retornados, gere uma análise completa e informativa.\n\nPreview dos Dados:\n{preview_text}\n\n"
+    system_prompt = "Você é um assistente de BI que explica resultados de forma clara e amigável. Use tópicos, negrito e tabelas em markdown."
+    user_content = f"Com base na pergunta '{question}' e nos dados retornados, gere uma análise completa.\n\nPreview:\n{preview_text}\n\n"
     if show_sql and sql_text:
         system_prompt += "\nSua resposta DEVE terminar com a consulta SQL utilizada."
-        user_content += f"Consulta SQL Executada:\n```sql\n{sql_text}\n```"
+        user_content += f"SQL Executada:\n```sql\n{sql_text}\n```"
     else:
         system_prompt += "\nNUNCA inclua o código SQL na sua resposta."
     messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}]
@@ -91,61 +85,83 @@ def generate_humanized_answer(client, model_name, question, df_result, sql_text=
 
 
 def generate_suggestions(client, model_name, schema_text, question):
-    """Gera sugestões de análise."""
-    system_prompt = "Você é um analista de dados sênior e proativo. Seu objetivo é ajudar o usuário a descobrir insights em seus dados.\nO usuário fez uma pergunta aberta. Com base no esquema dos dados, sugira de 3 a 5 perguntas ou tipos de gráficos interessantes que ele poderia fazer para explorar melhor seus dados.\nApresente as sugestões em formato de lista (tópicos)."
+    system_prompt = "Você é um analista de dados sênior e proativo. O usuário fez uma pergunta aberta. Com base no esquema, sugira de 3 a 5 perguntas ou gráficos interessantes que ele poderia fazer. Apresente em tópicos."
     messages = [{"role": "system", "content": system_prompt}, {"role": "user",
-                                                               "content": f"A minha pergunta foi: '{question}'.\n\nO esquema dos dados disponíveis é:\n{schema_text}\n\nCom base nisso, quais análises você me sugere?"}]
+                                                               "content": f"Minha pergunta foi: '{question}'.\n\nO esquema é:\n{schema_text}\n\nQuais análises você sugere?"}]
     resp = client.chat.completions.create(model=model_name, messages=messages, temperature=0.5, max_tokens=500)
     return resp.choices[0].message.content.strip()
 
 
-# --- FUNÇÕES DO DASHBOARD ---
+def generate_schema_summary(client, model_name, schema_text, question):
+    system_prompt = "Você é um arquiteto de dados e analista de negócios sênior. Sua tarefa é analisar o esquema de um banco de dados e fornecer um resumo executivo sobre seu propósito.\nINSTRUÇÕES:\n1. Infira o tema principal do banco (ex: 'Vendas', 'Bioinformática').\n2. Descreva as prováveis relações entre as tabelas.\n3. Apresente a resposta em seções como 'Tema Principal', 'Principais Entidades' e 'Possíveis Análises'.\n4. Baseie sua análise unicamente nos nomes fornecidos no esquema."
+    messages = [{"role": "system", "content": system_prompt}, {"role": "user",
+                                                               "content": f"A pergunta do usuário foi: '{question}'.\n\nO esquema do banco de dados é:\n{schema_text}\n\nPor favor, gere o resumo executivo sobre este banco de dados."}]
+    resp = client.chat.completions.create(model=model_name, messages=messages, temperature=0.3, max_tokens=1000)
+    return resp.choices[0].message.content.strip()
+
+
+# <<< NOVA FUNÇÃO PARA EXTRAIR NOME DA TABELA >>>
+def extract_table_name(client, model_name, question, schema_dict):
+    """Extrai o nome de uma tabela da pergunta do usuário."""
+    system_prompt = (
+        "Sua tarefa é extrair um único nome de tabela da pergunta do usuário. As tabelas disponíveis são listadas abaixo.\n"
+        "Responda APENAS com o nome exato da tabela em minúsculas. Se nenhuma tabela específica for mencionada ou se o usuário pedir uma lista de todas as tabelas, responda com a palavra 'NONE'."
+    )
+    table_list = "\n".join([f"- {t}" for t in schema_dict.keys()])
+    messages = [
+        {"role": "system", "content": system_prompt},
+        {"role": "user",
+         "content": f"As tabelas disponíveis são:\n{table_list}\n\nPergunta do usuário: '{question}'\n\nNome da tabela mencionada:"}
+    ]
+    try:
+        resp = client.chat.completions.create(model=model_name, messages=messages, temperature=0.0, max_tokens=50)
+        result = resp.choices[0].message.content.strip().lower().splitlines()[0]
+        return result if result in schema_dict.keys() else 'NONE'
+    except Exception:
+        return 'NONE'
+
+
+# <<< NOVA FUNÇÃO PARA FORMATAR DETALHES DA TABELA >>>
+def format_table_details(table_name, schema_dict):
+    """Formata os detalhes de uma tabela específica em Markdown."""
+    if table_name in schema_dict:
+        columns = schema_dict[table_name]
+        if not columns:
+            return f"A tabela `{table_name}` existe, mas não foi possível ler suas colunas."
+
+        header = f"### Detalhes da Tabela: `{table_name}`\n\n| Nome da Coluna | Tipo de Dado |\n|---|---|\n"
+        rows = [f"| `{col[0]}` | `{col[1]}` |" for col in columns]
+        return header + "\n".join(rows)
+    else:
+        return f"Desculpe, não encontrei uma tabela chamada `{table_name}`."
+
+
+# --- FUNÇÕES DO DASHBOARD E UTILITÁRIOS GERAIS ---
 def generate_chart_instructions(client, model_name, schema_text, question, db_mode, df_preview=None):
-    """Pede instruções de gráfico para a IA, com hierarquia de regras."""
     preview_text = df_preview.head(5).to_markdown(
         index=False) if df_preview is not None and not df_preview.empty else ""
-
     if db_mode:
-        dialect_instructions = "3. A consulta deve ser compatível com o dialeto PostgreSQL.\n4. Para agrupar por mês, use a função `to_char(\"nome_da_coluna_data\", 'YYYY-MM')`."
-    else:  # Modo Arquivo (pandasql/SQLite)
-        dialect_instructions = "3. A consulta deve ser compatível com o dialeto SQLite.\n4. Para agrupar por mês, use a função `strftime('%Y-%m', \"nome_da_coluna_data\")`."
-
+        dialect_instructions = "3. A consulta deve ser compatível com o dialeto PostgreSQL.\n4. Para agrupar por mês, use `to_char(\"nome_da_coluna_data\", 'YYYY-MM')`."
+    else:
+        dialect_instructions = "3. A consulta deve ser compatível com o dialeto SQLite.\n4. Para agrupar por mês, use `strftime('%Y-%m', \"nome_da_coluna_data\")`."
     system_content = (
             "Você é uma especialista sênior em visualização de dados. Sua missão é traduzir o pedido do usuário em uma configuração de gráfico completa e precisa.\n"
             "\n--- HIERARQUIA DE REGRAS ---\n"
-            "1. **PRIORIDADE MÁXIMA: OBEDECER AO USUÁRIO.** Se o usuário pedir um tipo de gráfico específico (ex: 'gráfico de pizza', 'gráfico de barras'), VOCÊ DEVE usar esse tipo no campo 'Tipo'. Não mude a escolha dele.\n"
-            "2. **MODO ESPECIALISTA (FALLBACK):** SOMENTE SE o pedido for vago ou não especificar um tipo de gráfico, use sua expertise para escolher a melhor visualização, seguindo as diretrizes abaixo:\n"
-            "   - Para comparações entre categorias -> use 'bar'.\n"
-            "   - Para tendências ao longo do tempo -> use 'line'.\n"
-            "   - Para a relação entre duas variáveis numéricas -> use 'scatter'.\n"
-            "   - Para a distribuição de uma variável -> use 'histogram'.\n"
-            "   - Para composição de um todo -> use 'pie'.\n"
+            "1. **PRIORIDADE MÁXIMA: OBEDECER AO USUÁRIO.** Se o usuário pedir um tipo de gráfico específico (ex: 'gráfico de pizza'), VOCÊ DEVE usar esse tipo.\n"
+            "2. **MODO ESPECIALISTA (FALLBACK):** SOMENTE SE o pedido for vago, use sua expertise para escolher a melhor visualização.\n"
             "\nREGRAS CRÍTICAS DE SINTAXE SQL:\n"
-            "1. Use EXCLUSIVAMENTE os nomes de colunas fornecidos no esquema. NÃO INVENTE nomes de colunas.\n"
-            "2. Se um nome de coluna contiver espaços ou caracteres especiais, você DEVE envolvê-lo em aspas duplas (ex: `\"Receita Total (R$)\"`).\n"
-            + dialect_instructions +
+            "1. Use EXCLUSIVAMENTE os nomes de colunas do esquema.\n2. Envolva colunas com espaços/caracteres especiais em aspas duplas.\n" + dialect_instructions +
             "\nREGRAS CRÍTICAS DE SAÍDA:\n"
-            "1. Gere um título inteligente e descritivo que corresponda ao pedido do usuário.\n"
-            "2. Se apropriado e se adicionar valor, use o parâmetro 'Color' para incluir uma dimensão extra na análise.\n"
-            "3. Retorne a resposta APENAS no formato especificado abaixo, sem nenhuma outra explicação.\n"
-            "\n--- FORMATO OBRIGATÓRIO ---\n"
-            "SQL: <query SQL para extrair os dados>\n"
-            "Tipo: <bar|line|pie|scatter|histogram|area>\n"
-            "X: <coluna para o eixo X>\n"
-            "Y: <coluna para o eixo Y>\n"
-            "Color: <(opcional) coluna para as cores>\n"
-            "Título: <título descritivo do gráfico>\n"
-            "Justificativa: <(opcional) por que este é o melhor gráfico para o pedido>"
+            "1. Gere um título inteligente.\n2. Se apropriado, use 'Color' para adicionar uma dimensão.\n3. Retorne APENAS no formato especificado abaixo.\n"
+            "\n--- FORMATO OBRIGATÓRIO ---\nSQL: <query>\nTipo: <bar|line|pie|scatter|histogram|area>\nX: <coluna X>\nY: <coluna Y>\nColor: <(opcional) coluna cor>\nTítulo: <título>"
     )
-
     messages = [{"role": "system", "content": system_content}, {"role": "user",
-                                                                "content": f"Esquema:\n{schema_text}\n\nPreview dos Dados:\n{preview_text}\n\nPedido do Usuário:\n{question}"}]
+                                                                "content": f"Esquema:\n{schema_text}\n\nPreview:\n{preview_text}\n\nPedido:\n{question}"}]
     resp = client.chat.completions.create(model=model_name, messages=messages, temperature=0.0, max_tokens=500)
     return resp.choices[0].message.content.strip()
 
 
 def parse_chart_instructions(text):
-    """Extrai SQL, tipo, eixos e título da resposta da IA."""
     chart = {"sql": None, "type": "bar", "x": None, "y": None, "color": None, "title": "Gráfico"}
     for line in text.splitlines():
         if line.strip().lower().startswith("sql:"):
@@ -164,27 +180,22 @@ def parse_chart_instructions(text):
 
 
 def _strip_quotes(val: str):
-    """Remove aspas extras de nomes de colunas."""
     if not isinstance(val, str): return val
     return val.strip().strip('"').strip("'")
 
 
 def render_chart(chart_config):
-    """Renderiza gráfico Plotly."""
     df = chart_config.get("df", pd.DataFrame())
-    if df is None or df.empty: st.warning("Sem dados para exibir neste gráfico."); return
-
-    tipo = chart_config.get("type", "bar")
-    x = _strip_quotes(chart_config.get("x")) if chart_config.get("x") else None
-    y = _strip_quotes(chart_config.get("y")) if chart_config.get("y") else None
-    color = _strip_quotes(chart_config.get("color")) if chart_config.get("color") else None
-
+    if df is None or df.empty: st.warning("Sem dados para exibir."); return
+    tipo = chart_config.get("type", "bar");
+    x = _strip_quotes(chart_config.get("x"));
+    y = _strip_quotes(chart_config.get("y"));
+    color = _strip_quotes(chart_config.get("color"))
     if x and x not in df.columns: st.error(f"Eixo X inválido '{x}'. Colunas: {list(df.columns)}"); return
     if y and y not in df.columns and tipo not in ["pie", "histogram"]: st.error(
         f"Eixo Y inválido '{y}'. Colunas: {list(df.columns)}"); return
     if color and color not in df.columns: st.error(
         f"Coluna de cor inválida '{color}'. Colunas: {list(df.columns)}"); return
-
     try:
         title = chart_config.get("title", "Gráfico")
         if tipo == "bar":
@@ -213,7 +224,7 @@ def validate_sql_tables(sql_text, db_mode, schema_dict=None):
         if not schema_dict: return True, None
         available = list(schema_dict.keys())
         found = any(re.search(r"\b" + re.escape(t.lower()) + r"\b", sql_lower) for t in available)
-        if not found: return False, f"Tabela não encontrada na consulta. Disponíveis: {', '.join(available)}"
+        if not found: return False, f"Tabela não encontrada. Disponíveis: {', '.join(available)}"
         return True, None
     else:
         if re.search(r"\bfrom\s+df\b", sql_lower) or re.search(r"\bfrom\s+\"df\"\b", sql_lower): return True, None
@@ -223,9 +234,7 @@ def validate_sql_tables(sql_text, db_mode, schema_dict=None):
 # ----------------------
 # App principal
 # ----------------------
-if 'logged_in' not in st.session_state:
-    st.session_state['logged_in'] = False
-
+if 'logged_in' not in st.session_state: st.session_state['logged_in'] = False
 if not st.session_state['logged_in']:
     show_login_page()
 else:
@@ -240,8 +249,7 @@ else:
                 st.session_state.fonte_dados = user_config.get('data_source_type', 'Banco de Dados')
                 if user_config.get('data_source_type') == 'database' and user_config.get('db_credentials'):
                     decrypted_creds = decrypt_credentials(user_config['db_credentials'])
-                    if decrypted_creds:
-                        st.session_state.db_creds = decrypted_creds
+                    if decrypted_creds: st.session_state.db_creds = decrypted_creds
             st.session_state.config_loaded = True
 
     with st.sidebar:
@@ -252,14 +260,13 @@ else:
         fonte_dados_index = 0 if st.session_state.get('fonte_dados', 'Banco de Dados') == 'Banco de Dados' else 1
         fonte_dados = st.selectbox("Fonte:", ["Banco de Dados", "Arquivo CSV/Excel"], index=fonte_dados_index)
         db_creds_saved = st.session_state.get('db_creds', {})
-        uploaded_file = None
         if fonte_dados == "Banco de Dados":
             with st.form("db_config_form"):
                 st.write("Insira e salve as credenciais do seu banco de dados.")
-                db_user = st.text_input("Usuário", value=db_creds_saved.get('user', ''))
+                db_user = st.text_input("Usuário", value=db_creds_saved.get('user', ''));
                 db_password = st.text_input("Senha", value=db_creds_saved.get('password', ''), type="password")
-                db_host = st.text_input("Host", value=db_creds_saved.get('host', ''))
-                db_port = st.text_input("Porta", value=db_creds_saved.get('port', ''))
+                db_host = st.text_input("Host", value=db_creds_saved.get('host', ''));
+                db_port = st.text_input("Porta", value=db_creds_saved.get('port', ''));
                 db_name = st.text_input("Banco", value=db_creds_saved.get('dbname', ''))
                 if st.form_submit_button("Salvar Conexão"):
                     credentials_to_save = {"user": db_user, "password": db_password, "host": db_host, "port": db_port,
@@ -269,10 +276,10 @@ else:
                             if save_db_config(st.session_state.user.id, credentials_to_save):
                                 st.session_state.db_creds = credentials_to_save;
                                 st.session_state.fonte_dados = 'database';
-                                st.success("Conexão salva com sucesso!");
+                                st.success("Conexão salva!");
                                 st.rerun()
                     else:
-                        st.warning("Preencha todos os campos do banco de dados.")
+                        st.warning("Preencha todos os campos.")
         else:
             uploaded_file = st.file_uploader("Upload CSV/Excel", type=["csv", "xlsx"])
 
@@ -285,21 +292,24 @@ else:
         else:
             client = OpenAI(api_key=openai_api_key)
             db_mode = (fonte_dados == "Banco de Dados")
-            schema_text = "(sem esquema)";
+            schema_text = "";
+            schema_dict = {};
             df_data = None;
             uri = None
             try:
-                if db_mode and 'db_creds' in st.session_state and all(st.session_state.db_creds.values()):
-                    creds = st.session_state.db_creds
-                    uri = f"postgresql+psycopg2://{creds['user']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['dbname']}"
-                    if st.session_state.get('connected_uri') != uri:
-                        with st.spinner("Analisando esquema do banco de dados..."):
-                            schema_text, schema_dict = introspect_schema(uri)
-                            st.session_state['schema_text'] = schema_text;
-                            st.session_state['schema_dict'] = schema_dict;
-                            st.session_state['connected_uri'] = uri
-                    schema_text = st.session_state.get('schema_text', "(sem esquema)")
-                elif not db_mode:
+                if db_mode:
+                    if 'db_creds' in st.session_state and all(st.session_state.db_creds.values()):
+                        creds = st.session_state.db_creds
+                        uri = f"postgresql+psycopg2://{creds['user']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['dbname']}"
+                        if st.session_state.get('connected_uri') != uri:
+                            with st.spinner("Analisando esquema do banco de dados..."):
+                                schema_text, schema_dict = introspect_schema(uri)
+                                st.session_state['schema_text'] = schema_text;
+                                st.session_state['schema_dict'] = schema_dict;
+                                st.session_state['connected_uri'] = uri
+                        schema_text = st.session_state.get('schema_text', "")
+                        schema_dict = st.session_state.get('schema_dict', {})
+                else:
                     if uploaded_file is not None:
                         df_data = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(
                             uploaded_file)
@@ -309,9 +319,9 @@ else:
                         df_data = st.session_state['df_data'];
                         schema_text = describe_dataframe_schema(df_data)
                     else:
-                        st.info("Faça upload de um arquivo CSV ou Excel para começar a análise.")
+                        st.info("Faça upload de um arquivo para começar.")
             except Exception as e:
-                st.error(f"Falha ao carregar a fonte de dados: {e}")
+                st.error(f"Falha ao carregar fonte de dados: {e}")
 
             if 'history' not in st.session_state: st.session_state.history = []
             for message in st.session_state.history:
@@ -324,7 +334,7 @@ else:
 
                 with st.chat_message("assistant"):
                     with st.spinner("Analisando..."):
-                        if (db_mode and schema_text == "(sem esquema)") or (not db_mode and df_data is None):
+                        if (db_mode and not schema_text) or (not db_mode and df_data is None):
                             st.warning("Fonte de dados não configurada.");
                             st.stop()
 
@@ -333,25 +343,32 @@ else:
                         final_text = "";
                         response_handled_internally = False
 
-                        if 'schema_info' in intent:
-                            final_text = f"Aqui estão as informações sobre a estrutura dos seus dados:\n\n```\n{schema_text}\n```"
+                        if 'schema_summary' in intent:
+                            final_text = generate_schema_summary(client, modelo_selecionado, schema_text, prompt)
+                        elif 'schema_info' in intent:
+                            current_schema_dict = st.session_state.get('schema_dict', {}) if db_mode else {
+                                'df': [(c, str(t)) for c, t in zip(df_data.columns, df_data.dtypes)]}
+                            table_name = extract_table_name(client, modelo_selecionado, prompt, current_schema_dict)
+                            if table_name != 'none':
+                                final_text = format_table_details(table_name, current_schema_dict)
+                            else:
+                                table_list = "\n".join([f"- `{t}`" for t in current_schema_dict.keys()])
+                                final_text = f"Aqui estão as tabelas/arquivos que encontrei:\n\n{table_list}"
                         elif 'suggestion_request' in intent:
                             final_text = generate_suggestions(client, modelo_selecionado, schema_text, prompt)
-                        else:
+                        else:  # intent == 'data_query'
                             if db_mode:
-                                system_prompt = "Você é um especialista em PostgreSQL. Gere SQL para responder a perguntas sobre o esquema fornecido."
+                                system_prompt = "Você é um especialista em PostgreSQL. Gere SQL para responder a perguntas sobre o esquema."
                             else:
-                                system_prompt = "Você é um especialista em pandasql para consultar um DataFrame 'df'.\nREGRAS CRÍTICAS:\n1. Use EXCLUSIVAMENTE os nomes de colunas do esquema.\n2. A tabela é SEMPRE 'df'.\n3. Envolva colunas com espaços/caracteres especiais em aspas duplas."
-
+                                system_prompt = "Você é um especialista em pandasql para consultar 'df'.\nREGRAS:\n1. Use EXCLUSIVAMENTE nomes de colunas do esquema.\n2. A tabela é SEMPRE 'df'.\n3. Envolva colunas com espaços/caracteres especiais em aspas duplas."
                             sql_candidate = generate_sql(client, modelo_selecionado, system_prompt, schema_text,
                                                          history_text, prompt)
                             sql_text = extract_sql(sql_candidate)
-
                             if not sql_text or "NO_SQL" in sql_candidate.upper():
                                 final_text = generate_suggestions(client, modelo_selecionado, schema_text, prompt)
                             else:
-                                schema_dict = st.session_state.get('schema_dict', {})
-                                ok, vmsg = validate_sql_tables(sql_text, db_mode, schema_dict)
+                                schema_dict_ctx = st.session_state.get('schema_dict', {})
+                                ok, vmsg = validate_sql_tables(sql_text, db_mode, schema_dict_ctx)
                                 if not ok:
                                     final_text = f"Erro de validação: {vmsg}"
                                 else:
@@ -370,7 +387,7 @@ else:
                                         st.session_state.history.append({"role": "assistant", "content": final_text})
                                         response_handled_internally = True
                                     except Exception as e:
-                                        final_text = f"Ocorreu um erro ao executar a análise: {e}"
+                                        final_text = f"Ocorreu um erro na análise: {e}"
                         if not response_handled_internally:
                             st.markdown(final_text)
                             st.session_state.history.append({"role": "assistant", "content": final_text})
@@ -379,8 +396,7 @@ else:
         st.header("Dashboard Interativo 📊")
         if 'charts' not in st.session_state: st.session_state.charts = []
         db_mode_dash = (fonte_dados == "Banco de Dados")
-        schema_text_ctx = st.session_state.get(
-            'schema_text') if db_mode_dash and 'schema_text' in st.session_state else describe_dataframe_schema(
+        schema_text_ctx = st.session_state.get('schema_text', '') if db_mode_dash else describe_dataframe_schema(
             st.session_state.get('df_data', pd.DataFrame()))
         schema_dict_ctx = st.session_state.get('schema_dict') if db_mode_dash else None
         df_data_ctx = st.session_state.get('df_data') if not db_mode_dash else None

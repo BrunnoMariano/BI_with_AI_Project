@@ -1,0 +1,16 @@
+streamlit
+openai
+langchain
+langchain-openai
+psycopg2-binary
+pandas
+plotly
+langchain-community
+langchain-experimental
+supabase
+streamlit-authenticator
+SQLAlchemy
+tabulate
+pandasql
+openpyxl
+cryptography

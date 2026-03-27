@@ -276,7 +276,11 @@ def validate_sql_tables(sql_text, db_mode, schema_dict=None):
     if not sql_text: return False, "Consulta SQL vazia.", sql_text
     
     if not db_mode:
-        sql_text = re.sub(r"(?i)\b(?:from|join)\s+[`'\"]?[a-zA-Z0-9_]+[`'\"]?\b", "FROM df", sql_text)
+        # Regex mais robusta para pegar nomes de tabela com espaços, aspas ou nomes simples
+        sql_text = re.sub(r"(?i)\b(FROM|JOIN)\s+([\"'`][^\"'`]+[\"'`]|[\w]+)", r"\1 df", sql_text)
+        # Garantia final: Se por algum motivo o regex falhou e não temos 'FROM df', forçamos uma substituição básica
+        if "from df" not in sql_text.lower():
+            sql_text = re.sub(r"(?i)\bFROM\s+[\s\w\"'`]+", "FROM df", sql_text)
         
     sql_lower = sql_text.lower()
     if db_mode:

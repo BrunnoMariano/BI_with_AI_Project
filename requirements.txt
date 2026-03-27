@@ -1,0 +1,10 @@
+streamlit
+pandas
+plotly
+sqlalchemy
+psycopg2-binary
+openai
+pandasql
+streamlit-option-menu
+openpyxl
+cryptography

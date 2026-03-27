@@ -60,13 +60,9 @@ h1 {
 </style>
 """, unsafe_allow_html=True)
 # ----------------------
-# Usuário e Sessão Local (Substituindo Supabase)
+# Sessão Local (Sem Autenticação)
 # ----------------------
-if 'user' not in st.session_state:
-    class LocalUser:
-        id = "local_dev_user"
-        email = "dev@local.user"
-    st.session_state.user = LocalUser()
+if 'logged_in' not in st.session_state:
     st.session_state['logged_in'] = True
 
 # ----------------------
@@ -294,33 +290,17 @@ def validate_sql_tables(sql_text, db_mode, schema_dict=None):
         return False, "Erro na tabela para pandasql.", sql_text
 
 
-# ----------------------
-# App principal
-# ----------------------
-# Bypass Auth:
+# Bypass Auth (Always Logged In):
 st.session_state['logged_in'] = True
-if 'user' not in st.session_state:
-    class MockUser:
-        id = "dev_local_user_id"
-        email = "dev@local.user"
-    st.session_state.user = MockUser()
 
 if not st.session_state['logged_in']:
-    show_login_page()
+    st.info("Por favor, acesse o sistema.")
 else:
     st.title("Análise Inteligente de Dados")
     # show_logout_button()
 
     if 'config_loaded' not in st.session_state:
-        user_id = st.session_state.user.id
-        with st.spinner("Carregando configurações..."):
-            user_config = get_user_config(user_id)
-            if user_config:
-                st.session_state.fonte_dados = user_config.get('data_source_type', 'Banco de Dados')
-                if user_config.get('data_source_type') == 'database' and user_config.get('db_credentials'):
-                    decrypted_creds = decrypt_credentials(user_config['db_credentials'])
-                    if decrypted_creds: st.session_state.db_creds = decrypted_creds
-            st.session_state.config_loaded = True
+        st.session_state.config_loaded = True
 
     uploaded_file = None
     with st.sidebar:
@@ -393,11 +373,11 @@ else:
                                                "dbname": db_name}
                         if all(credentials_to_save.values()):
                             with st.spinner("Salvando..."):
-                                if save_db_config(st.session_state.user.id, credentials_to_save):
-                                    st.session_state.db_creds = credentials_to_save;
-                                    st.session_state.fonte_dados = 'Banco de Dados';
-                                    st.success("Conexão salva!");
-                                    st.rerun()
+                                # Simulação de salvamento sem ID de usuário
+                                st.session_state.db_creds = credentials_to_save;
+                                st.session_state.fonte_dados = 'Banco de Dados';
+                                st.success("Conexão salva!");
+                                st.rerun()
                         else:
                             st.warning("Preencha todos os campos.")
             else:

@@ -89,7 +89,11 @@ def extract_sql(text: str) -> str:
 
 def describe_dataframe_schema(df: pd.DataFrame) -> str:
     lines = [f"A tabela se chama 'df' e possui as seguintes colunas:"]
-    for col in df.columns: lines.append(f'- "{col}" (tipo: {str(df[col].dtype)})')
+    for col in df.columns:
+        sample_values = df[col].dropna().unique()[:3]
+        sample_str = ", ".join([repr(v) for v in sample_values])
+        lines.append(f'- "{col}" (tipo: {str(df[col].dtype)}, exemplos: {sample_str})')
+    lines.append(f"\nTotal de registros: {len(df)}")
     return "\n".join(lines)
 
 
@@ -98,18 +102,24 @@ def describe_dataframe_schema(df: pd.DataFrame) -> str:
 def classify_intent(client, model_name, question, history_text):
     """Classifica a intenção do usuário em uma de quatro categorias."""
     system_prompt = (
-        "Você é um especialista em interpretar a intenção do usuário. Classifique a pergunta em uma das categorias:\n"
-        "- `data_query`: Pedido de dados específicos, totais, médias, que exija uma consulta SQL.\n"
-        "- `schema_info`: Pedido sobre a estrutura dos dados ('quais tabelas existem?', 'descreva a tabela X').\n"
-        "- `schema_summary`: Pedido de uma explicação ou resumo sobre o propósito do banco de dados ('o que é esse banco?', 'qual o contexto dos dados?').\n"
-        "- `suggestion_request`: Pedido de sugestões, ideias, ou uma pergunta geral/aberta ('olá', 'me ajude').\n"
-        "Responda APENAS com a categoria."
+        "Classifique a intenção do usuário em UMA das categorias abaixo. "
+        "Responda APENAS com o nome da categoria, sem explicação, sem aspas, sem pontuação.\n\n"
+        "Categorias:\n"
+        "- data_query: Pedido de dados, totais, médias, filtros, listas, comparações. "
+        "Ex: 'qual o total de vendas?', 'quais produtos venderam mais?', 'mostre os dados de outubro', "
+        "'tem dados de setembro?', 'quais foram os dados?', 'quanto vendeu em janeiro?'\n"
+        "- schema_info: Pedido sobre estrutura dos dados. "
+        "Ex: 'quais colunas tem?', 'descreva a tabela X', 'quais tabelas existem?'\n"
+        "- schema_summary: Pedido sobre contexto geral do banco. "
+        "Ex: 'o que é esse banco?', 'que tipo de dados são esses?', 'qual o contexto?'\n"
+        "- suggestion_request: Saudação, pedido aberto ou vago. "
+        "Ex: 'olá', 'me ajude', 'o que posso perguntar?', 'boa tarde'\n"
     )
     messages = [{"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Histórico:\n{history_text}\n\nPergunta do usuário:\n{question}"}]
     try:
-        resp = client.chat.completions.create(model=model_name, messages=messages, temperature=1.0 if 'o' in model_name else 0.0, max_completion_tokens=50)
-        return resp.choices[0].message.content.strip().lower().replace('`', '')
+        resp = client.chat.completions.create(model=model_name, messages=messages, temperature=1.0 if 'o' in model_name else 0.0, max_completion_tokens=20)
+        return resp.choices[0].message.content.strip().lower().replace('`', '').strip()
     except Exception:
         return 'data_query'
 
@@ -122,33 +132,54 @@ def generate_sql(client, model_name, system_prompt, schema_text, history_text, q
 
 
 def generate_humanized_answer(client, model_name, question, df_result, sql_text=None, show_sql=False):
-    preview_text = df_result.head(10).to_markdown(
+    preview_text = df_result.head(15).to_markdown(
         index=False) if df_result is not None and not df_result.empty else "(A consulta não retornou dados)"
-    system_prompt = "Você é um assistente de BI que explica resultados de forma clara e amigável. Use tópicos, negrito e tabelas em markdown."
-    user_content = f"Com base na pergunta '{question}' e nos dados retornados, gere uma análise completa.\n\nPreview:\n{preview_text}\n\n"
+    system_prompt = (
+        "Você é um assistente de dados. Responda de forma DIRETA e CONCISA.\n\n"
+        "REGRAS OBRIGATÓRIAS:\n"
+        "1. Responda EXATAMENTE o que foi perguntado. Nada mais, nada menos.\n"
+        "2. Se a pergunta é simples (ex: 'qual o total?', 'quais os dados?'), responda em 1-3 frases curtas.\n"
+        "3. Se houver múltiplas linhas de dados, apresente como tabela markdown.\n"
+        "4. NUNCA adicione seções como: 'Insights', 'Observações', 'Recomendações', 'Próximos passos', 'Resumo', 'Conclusão'.\n"
+        "5. Use **negrito** para destacar números importantes.\n"
+        "6. Seja natural e amigável, mas objetivo.\n"
+        "7. Se os dados já respondem a pergunta claramente, apenas apresente-os sem elaborar."
+    )
+    user_content = f"Pergunta: '{question}'\n\nDados retornados:\n{preview_text}\n\n"
     if show_sql and sql_text:
-        system_prompt += "\nSua resposta DEVE terminar com a consulta SQL utilizada."
+        system_prompt += "\nAo final da resposta, inclua a query SQL usada em um bloco de código."
         user_content += f"SQL Executada:\n```sql\n{sql_text}\n```"
     else:
-        system_prompt += "\nNUNCA inclua o código SQL na sua resposta."
+        system_prompt += "\nNUNCA inclua código SQL na resposta."
     messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}]
-    resp = client.chat.completions.create(model=model_name, messages=messages, temperature=1.0 if 'o' in model_name else 0.2, max_completion_tokens=1500)
+    resp = client.chat.completions.create(model=model_name, messages=messages, temperature=1.0 if 'o' in model_name else 0.2, max_completion_tokens=600)
     return resp.choices[0].message.content.strip()
 
 
 def generate_suggestions(client, model_name, schema_text, question):
-    system_prompt = "Você é um analista de dados sênior e proativo. O usuário fez uma pergunta aberta. Com base no esquema, sugira de 3 a 5 perguntas ou gráficos interessantes que ele poderia fazer. Apresente em tópicos."
+    system_prompt = (
+        "Sugira exatamente 3 perguntas úteis que o usuário pode fazer sobre esses dados. "
+        "Seja breve — uma frase por sugestão. Formato:\n"
+        "1. [pergunta]\n2. [pergunta]\n3. [pergunta]\n\n"
+        "Não adicione introdução nem conclusão."
+    )
     messages = [{"role": "system", "content": system_prompt}, {"role": "user",
-                                                               "content": f"Minha pergunta foi: '{question}'.\n\nO esquema é:\n{schema_text}\n\nQuais análises você sugere?"}]
-    resp = client.chat.completions.create(model=model_name, messages=messages, temperature=1.0 if 'o' in model_name else 0.5, max_completion_tokens=800)
+                                                                "content": f"Pergunta do usuário: '{question}'\n\nEsquema dos dados:\n{schema_text}"}]
+    resp = client.chat.completions.create(model=model_name, messages=messages, temperature=1.0 if 'o' in model_name else 0.5, max_completion_tokens=300)
     return resp.choices[0].message.content.strip()
 
 
 def generate_schema_summary(client, model_name, schema_text, question):
-    system_prompt = "Você é um arquiteto de dados e analista de negócios sênior. Sua tarefa é analisar o esquema de um banco de dados e fornecer um resumo executivo sobre seu propósito.\nINSTRUÇÕES:\n1. Infira o tema principal do banco (ex: 'Vendas', 'Bioinformática').\n2. Descreva as prováveis relações entre as tabelas.\n3. Apresente a resposta em seções como 'Tema Principal', 'Principais Entidades' e 'Possíveis Análises'.\n4. Baseie sua análise unicamente nos nomes fornecidos no esquema."
+    system_prompt = (
+        "Descreva este banco de dados em NO MÁXIMO 3 parágrafos curtos:\n"
+        "1. Qual o tema principal (ex: Vendas, RH, Logística).\n"
+        "2. Quais são as principais tabelas e seus propósitos.\n"
+        "3. Que tipos de análises podem ser feitas.\n\n"
+        "Seja direto e objetivo. Não use seções com títulos, apenas texto corrido."
+    )
     messages = [{"role": "system", "content": system_prompt}, {"role": "user",
-                                                               "content": f"A pergunta do usuário foi: '{question}'.\n\nO esquema do banco de dados é:\n{schema_text}\n\nPor favor, gere o resumo executivo sobre este banco de dados."}]
-    resp = client.chat.completions.create(model=model_name, messages=messages, temperature=1.0 if 'o' in model_name else 0.3, max_completion_tokens=1500)
+                                                                "content": f"Pergunta do usuário: '{question}'\n\nEsquema:\n{schema_text}"}]
+    resp = client.chat.completions.create(model=model_name, messages=messages, temperature=1.0 if 'o' in model_name else 0.3, max_completion_tokens=500)
     return resp.choices[0].message.content.strip()
 
 
@@ -193,9 +224,16 @@ def generate_chart_instructions(client, model_name, schema_text, question, db_mo
     preview_text = df_preview.head(5).to_markdown(
         index=False) if df_preview is not None and not df_preview.empty else ""
     if db_mode:
-        dialect_instructions = "3. A consulta deve ser compatível com o dialeto PostgreSQL.\n4. Para agrupar por mês, use `to_char(\"nome_da_coluna_data\", 'YYYY-MM')`."
+        dialect_instructions = (
+            "3. A consulta deve ser compatível com o dialeto PostgreSQL.\n"
+            "4. Para agrupar por mês, use `to_char(\"nome_da_coluna_data\", 'YYYY-MM')`."
+        )
     else:
-        dialect_instructions = "3. A consulta deve ser compatível com o dialeto SQLite.\n4. Para agrupar por mês, use `strftime('%Y-%m', \"nome_da_coluna_data\")`."
+        dialect_instructions = (
+            "3. A consulta deve ser compatível com o dialeto SQLite.\n"
+            "4. A tabela para consulta é SEMPRE `df`. Nunca use outro nome de tabela.\n"
+            "5. Para agrupar por mês, use `strftime('%Y-%m', \"nome_da_coluna_data\")`."
+        )
     system_content = (
             "Você é uma especialista sênior em visualização de dados. Sua missão é traduzir o pedido do usuário em uma configuração de gráfico completa e precisa.\n"
             "\n--- HIERARQUIA DE REGRAS ---\n"
@@ -215,19 +253,39 @@ def generate_chart_instructions(client, model_name, schema_text, question, db_mo
 
 def parse_chart_instructions(text):
     chart = {"sql": None, "type": "bar", "x": None, "y": None, "color": None, "title": "Gráfico"}
-    for line in text.splitlines():
-        if line.strip().lower().startswith("sql:"):
-            chart["sql"] = line.split(":", 1)[1].strip()
-        elif line.strip().lower().startswith("tipo:"):
-            chart["type"] = line.split(":", 1)[1].strip().lower()
-        elif line.strip().lower().startswith("x:"):
-            chart["x"] = line.split(":", 1)[1].strip()
-        elif line.strip().lower().startswith("y:"):
-            chart["y"] = line.split(":", 1)[1].strip()
-        elif line.strip().lower().startswith("color:"):
-            chart["color"] = line.split(":", 1)[1].strip()
-        elif line.strip().lower().startswith("título:") or line.strip().lower().startswith("titulo:"):
-            chart["title"] = line.split(":", 1)[1].strip()
+    current_field = None
+    sql_lines = []
+
+    for raw_line in text.splitlines():
+        line = raw_line.strip()
+        lower = line.lower()
+
+        if lower.startswith("sql:"):
+            current_field = "sql"
+            sql_value = raw_line.split(":", 1)[1].strip()
+            if sql_value:
+                sql_lines.append(sql_value)
+        elif lower.startswith("tipo:"):
+            current_field = None
+            chart["type"] = raw_line.split(":", 1)[1].strip().lower()
+        elif lower.startswith("x:"):
+            current_field = None
+            chart["x"] = raw_line.split(":", 1)[1].strip()
+        elif lower.startswith("y:"):
+            current_field = None
+            chart["y"] = raw_line.split(":", 1)[1].strip()
+        elif lower.startswith("color:"):
+            current_field = None
+            chart["color"] = raw_line.split(":", 1)[1].strip()
+        elif lower.startswith("título:") or lower.startswith("titulo:"):
+            current_field = None
+            chart["title"] = raw_line.split(":", 1)[1].strip()
+        elif current_field == "sql":
+            sql_lines.append(raw_line.rstrip())
+
+    if sql_lines:
+        chart["sql"] = "\n".join(sql_lines).strip().strip("`")
+
     return chart
 
 
@@ -462,9 +520,41 @@ else:
                             final_text = generate_suggestions(client, modelo_selecionado, schema_text, prompt)
                         else:  # intent == 'data_query'
                             if db_mode:
-                                system_prompt = "Você é um especialista em PostgreSQL. Gere SQL para responder a perguntas sobre o esquema."
+                                system_prompt = (
+                                    "Você gera EXCLUSIVAMENTE queries SQL compatíveis com PostgreSQL.\n\n"
+                                    "REGRAS ABSOLUTAS:\n"
+                                    "1. Use APENAS tabelas e colunas que existem no esquema fornecido. NUNCA invente.\n"
+                                    "2. Envolva nomes com caracteres especiais ou espaços em aspas duplas.\n"
+                                    "3. Use sintaxe PostgreSQL válida.\n"
+                                    "4. Retorne APENAS o SQL puro, sem explicações, sem markdown, sem ```.\n"
+                                )
                             else:
-                                system_prompt = "Você é um especialista em pandasql para consultar 'df'.\nREGRAS:\n1. Use EXCLUSIVAMENTE nomes de colunas do esquema.\n2. A tabela é SEMPRE 'df'.\n3. Envolva colunas com espaços/caracteres especiais em aspas duplas."
+                                system_prompt = (
+                                    "Você gera EXCLUSIVAMENTE queries SQL compatíveis com SQLite para consultar um DataFrame chamado 'df'.\n\n"
+                                    "REGRAS ABSOLUTAS — VIOLÁ-LAS É UM ERRO FATAL:\n"
+                                    "1. A tabela é SEMPRE 'df'. NUNCA use outro nome de tabela.\n"
+                                    "2. Use APENAS colunas que existem no esquema fornecido. NUNCA invente colunas.\n"
+                                    "3. Envolva TODOS os nomes de colunas em aspas duplas. Ex: SELECT \"Mês\", \"Quantidade Vendida\" FROM df\n"
+                                    "4. Gere UMA única consulta SELECT. Não use múltiplas instruções SQL, CTEs complexas, UNION ou código Python.\n"
+                                    "5. Use APENAS recursos SQLite simples: SUM, AVG, COUNT, MIN, MAX, GROUP BY, ORDER BY, DESC, ASC, WHERE, LIKE, IN, BETWEEN, LOWER, UPPER, LIMIT.\n"
+                                    "6. NUNCA use: ILIKE, to_char, EXTRACT, DATE_TRUNC, ::, CAST com tipos PostgreSQL, window functions ou sintaxe específica de PostgreSQL.\n"
+                                    "7. Para filtrar texto, use: WHERE \"coluna\" IN ('Valor1', 'Valor2') ou WHERE LOWER(\"coluna\") LIKE '%valor%'\n"
+                                    "8. Se a pergunta pedir 'quantidade por categoria' e também 'qual vendeu mais/menos', retorne a agregação por categoria ordenada do maior para o menor ou do menor para o maior. Não faça subconsulta.\n"
+                                    "9. Retorne APENAS o SQL puro. NUNCA inclua explicações, comentários, markdown ou ```.\n"
+                                    "10. NUNCA escreva código Python. Apenas SQL.\n\n"
+                                    "EXEMPLO CORRETO:\n"
+                                    "Pergunta: 'total de vendas por mês'\n"
+                                    "Resposta: SELECT \"Mês\", SUM(\"Quantidade Vendida\") AS total FROM df GROUP BY \"Mês\"\n\n"
+                                    "EXEMPLO CORRETO:\n"
+                                    "Pergunta: 'dados de outubro e setembro'\n"
+                                    "Resposta: SELECT * FROM df WHERE \"Mês\" IN ('Outubro', 'Setembro')\n\n"
+                                    "EXEMPLO CORRETO:\n"
+                                    "Pergunta: 'retorne a quantidade vendida por marca e qual a marca que vendeu mais'\n"
+                                    "Resposta: SELECT \"Marca\", SUM(\"Quantidade Vendida\") AS total_vendido FROM df GROUP BY \"Marca\" ORDER BY total_vendido DESC\n\n"
+                                    "EXEMPLO CORRETO:\n"
+                                    "Pergunta: 'quais foram os dados?'\n"
+                                    "Resposta: SELECT * FROM df\n"
+                                )
                             sql_candidate = generate_sql(client, modelo_selecionado, system_prompt, schema_text,
                                                          history_text, prompt)
                             sql_text = extract_sql(sql_candidate)
@@ -474,24 +564,57 @@ else:
                                 schema_dict_ctx = st.session_state.get('schema_dict', {})
                                 ok, vmsg, sql_text = validate_sql_tables(sql_text, db_mode, schema_dict_ctx)
                                 if not ok:
-                                    final_text = f"Erro de validação: {vmsg}"
+                                    final_text = f"Não consegui gerar uma consulta válida para sua pergunta. Tente reformular de forma mais específica."
                                 else:
-                                    try:
-                                        if db_mode:
-                                            engine = create_engine(uri);
-                                            df_result = pd.read_sql(text(sql_text), engine)
-                                        else:
-                                            df_result = ps.sqldf(sql_text, {"df": df_data})
+                                    # Mecanismo de retry: tenta executar, se falhar, pede correção à IA
+                                    max_retries = 2
+                                    sql_succeeded = False
+                                    df_result = None
+                                    last_error = None
+                                    for attempt in range(max_retries):
+                                        try:
+                                            if db_mode:
+                                                engine = create_engine(uri)
+                                                df_result = pd.read_sql(text(sql_text), engine)
+                                            else:
+                                                df_result = ps.sqldf(sql_text, {"df": df_data})
+                                            sql_succeeded = True
+                                            break
+                                        except Exception as e:
+                                            last_error = str(e)
+                                            if attempt < max_retries - 1:
+                                                # Pede para a IA corrigir o SQL com o erro como contexto
+                                                fix_prompt = (
+                                                    f"A query SQL abaixo falhou com erro: {e}\n\n"
+                                                    f"Query que falhou:\n{sql_text}\n\n"
+                                                    f"Pergunta original: {prompt}\n\n"
+                                                    "Corrija a query usando UMA única instrução SELECT compatível com SQLite para a tabela df. "
+                                                    "Se a pergunta pedir agregação por categoria e também o maior valor, retorne a agregação ordenada do maior para o menor. "
+                                                    "Retorne APENAS o SQL corrigido."
+                                                )
+                                                sql_candidate = generate_sql(client, modelo_selecionado, system_prompt,
+                                                                             schema_text, "", fix_prompt)
+                                                sql_text = extract_sql(sql_candidate)
+                                                ok, vmsg, sql_text = validate_sql_tables(sql_text, db_mode, schema_dict_ctx)
+                                                if not ok:
+                                                    sql_succeeded = False
+                                                    break
+                                            else:
+                                                sql_succeeded = False
+
+                                    if sql_succeeded and df_result is not None:
                                         final_text = generate_humanized_answer(client, modelo_selecionado, prompt,
                                                                                df_result, sql_text, show_sql=db_mode)
                                         st.markdown(final_text)
                                         if not df_result.empty:
-                                            st.subheader("Preview dos dados retornados");
+                                            st.subheader("Preview dos dados retornados")
                                             st.dataframe(df_result.head(100))
                                         st.session_state.history.append({"role": "assistant", "content": final_text})
                                         response_handled_internally = True
-                                    except Exception as e:
-                                        final_text = f"Ocorreu um erro na análise: {e}"
+                                    else:
+                                        final_text = "Desculpe, não consegui processar essa consulta. Tente reformular sua pergunta de forma mais específica."
+                                        if last_error:
+                                            st.caption(f"Detalhe técnico: {last_error}")
                         if not response_handled_internally:
                             st.markdown(final_text)
                             st.session_state.history.append({"role": "assistant", "content": final_text})

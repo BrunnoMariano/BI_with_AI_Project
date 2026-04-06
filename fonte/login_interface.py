@@ -1,5 +1,6 @@
 import streamlit as st
-from auth import login_user, register_user, logout_user, is_user_logged_in, get_current_user
+from auth import get_current_user, login_user, logout_user, register_user, resend_verification_email
+from user_data import restore_user_session
 
 
 def show_login_page():
@@ -19,15 +20,21 @@ def show_login_page():
             if submit_button:
                 if email and password:
                     response = login_user(email, password)
-                    if response and response.user:
-                        st.success("Login realizado com sucesso!")
-                        st.session_state['user'] = response.user
-                        st.session_state['logged_in'] = True
-                        st.rerun()
+                    if response and response.get("idToken"):
+                        if response.get("emailVerified"):
+                            st.success("Login realizado com sucesso!")
+                            restore_user_session(response)
+                            st.rerun()
+                        else:
+                            st.warning("Seu e-mail ainda não foi verificado. Verifique sua caixa de entrada antes de entrar.")
                     else:
                         st.error("E-mail ou senha incorretos!")
                 else:
                     st.error("Por favor, preencha todos os campos!")
+
+        if email and password and st.button("Reenviar e-mail de verificação", key="resend_verification"):
+            if resend_verification_email(email, password):
+                st.success("E-mail de verificação reenviado.")
 
     with tab2:
         st.header("Criar Conta")
@@ -42,8 +49,8 @@ def show_login_page():
                     if new_password == confirm_password:
                         if len(new_password) >= 6:
                             response = register_user(new_email, new_password)
-                            if response and response.user:
-                                st.success("Conta criada com sucesso! Verifique seu e-mail para confirmar.")
+                            if response and response.get("idToken"):
+                                st.success("Conta criada com sucesso! Enviamos um e-mail de verificação para você.")
                             else:
                                 st.error("Erro ao criar conta. Tente novamente.")
                         else:
@@ -58,11 +65,8 @@ def show_logout_button():
     """Mostra o botão de logout na barra lateral"""
     with st.sidebar:
         user = get_current_user()
-        if user and user.user:
-            st.write(f"👤 Logado como: {user.user.email}")
+        if user and user.get("email"):
+            st.write(f"👤 Logado como: {user['email']}")
             if st.button("Sair"):
                 logout_user()
-                st.session_state['logged_in'] = False
-                if 'user' in st.session_state:
-                    del st.session_state['user']
                 st.rerun()

@@ -10,3 +10,4 @@ sqlalchemy
 streamlit-option-menu
 tabulate
 cryptography
+requests

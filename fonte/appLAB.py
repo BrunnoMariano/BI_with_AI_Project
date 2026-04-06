@@ -4,11 +4,17 @@ import pandas as pd
 import plotly.express as px
 import re
 from sqlalchemy import create_engine, text
-# from login_interface import show_login_page, show_logout_button
+from login_interface import show_login_page, show_logout_button
 from db_utils import introspect_schema
 from openai import OpenAI
 import pandasql as ps
-from user_data import get_user_config, save_db_config, decrypt_credentials
+from user_data import (
+    append_chat_message,
+    clear_chat_history,
+    load_dataframe_from_storage,
+    save_db_config,
+    save_uploaded_file,
+)
 from streamlit_option_menu import option_menu
 
 st.set_page_config(page_title="Plataforma de Dados", page_icon="⚙️", layout="wide")
@@ -60,10 +66,10 @@ h1 {
 </style>
 """, unsafe_allow_html=True)
 # ----------------------
-# Sessão Local (Sem Autenticação)
+# Estado de Autenticação Inicial
 # ----------------------
 if 'logged_in' not in st.session_state:
-    st.session_state['logged_in'] = True
+    st.session_state['logged_in'] = False
 
 # ----------------------
 # Utilitários e Funções da IA
@@ -352,14 +358,17 @@ def validate_sql_tables(sql_text, db_mode, schema_dict=None):
         return False, "Erro na tabela para pandasql.", sql_text
 
 
-# Bypass Auth (Always Logged In):
-st.session_state['logged_in'] = True
+def has_complete_db_credentials(credentials):
+    required_keys = ("user", "password", "host", "port", "dbname")
+    return isinstance(credentials, dict) and all(credentials.get(key) for key in required_keys)
 
-if not st.session_state['logged_in']:
-    st.info("Por favor, acesse o sistema.")
+
+# Verificação de Autenticação
+if not st.session_state.get('logged_in', False):
+    show_login_page()
 else:
     st.title("Análise Inteligente de Dados")
-    # show_logout_button()
+    show_logout_button()
 
     if 'config_loaded' not in st.session_state:
         st.session_state.config_loaded = True
@@ -435,7 +444,8 @@ else:
                                                "dbname": db_name}
                         if all(credentials_to_save.values()):
                             with st.spinner("Salvando..."):
-                                # Simulação de salvamento sem ID de usuário
+                                user = st.session_state.get("user", {})
+                                save_db_config(user.get("user_id", ""), credentials_to_save)
                                 st.session_state.db_creds = credentials_to_save;
                                 st.session_state.fonte_dados = 'Banco de Dados';
                                 st.success("Conexão salva!");
@@ -443,7 +453,34 @@ else:
                         else:
                             st.warning("Preencha todos os campos.")
             else:
+                user_files = st.session_state.get("user_files", [])
+                if user_files:
+                    file_labels = ["Selecione um arquivo salvo"] + [
+                        f"{file['name']} ({file.get('uploaded_at', '')[:19]})" for file in user_files
+                    ]
+                    default_index = 0
+                    current_file_id = st.session_state.get("selected_file_id")
+                    for idx, file in enumerate(user_files, start=1):
+                        if file["file_id"] == current_file_id:
+                            default_index = idx
+                            break
+                    selected_label = st.selectbox("Arquivos salvos", file_labels, index=default_index)
+                    if selected_label == file_labels[0]:
+                        st.session_state["selected_file_id"] = None
+                    else:
+                        selected_index = file_labels.index(selected_label) - 1
+                        st.session_state["selected_file_id"] = user_files[selected_index]["file_id"]
+
                 uploaded_file = st.file_uploader("Upload CSV/Excel", type=["csv", "xlsx"])
+                if uploaded_file is not None:
+                    upload_signature = f"{uploaded_file.name}:{uploaded_file.size}"
+                    if st.session_state.get("last_uploaded_file_signature") != upload_signature:
+                        with st.spinner("Enviando arquivo para o Firebase..."):
+                            saved_file = save_uploaded_file(uploaded_file)
+                            st.session_state["last_uploaded_file_signature"] = upload_signature
+                            st.session_state["selected_file_id"] = saved_file["file_id"]
+                            st.success("Arquivo enviado e vinculado a sua conta.")
+                            st.rerun()
     tab1, tab2, tab3 = st.tabs(["Conversa", "Dashboard", "Histórico"])
 
     with tab1:
@@ -459,7 +496,7 @@ else:
             uri = None
             try:
                 if db_mode:
-                    if 'db_creds' in st.session_state and all(st.session_state.db_creds.values()):
+                    if has_complete_db_credentials(st.session_state.get('db_creds')):
                         creds = st.session_state.db_creds
                         uri = f"postgresql+psycopg2://{creds['user']}:{creds['password']}@{creds['host']}:{creds['port']}/{creds['dbname']}"
                         if st.session_state.get('connected_uri') != uri:
@@ -471,16 +508,24 @@ else:
                         schema_text = st.session_state.get('schema_text', "")
                         schema_dict = st.session_state.get('schema_dict', {})
                 else:
-                    if uploaded_file is not None:
-                        df_data = pd.read_csv(uploaded_file) if uploaded_file.name.endswith(".csv") else pd.read_excel(
-                            uploaded_file)
-                        st.session_state['df_data'] = df_data;
+                    selected_file_id = st.session_state.get("selected_file_id")
+                    user_files = st.session_state.get("user_files", [])
+                    selected_file = next((file for file in user_files if file["file_id"] == selected_file_id), None)
+
+                    if selected_file is not None and st.session_state.get("loaded_file_id") != selected_file_id:
+                        with st.spinner("Carregando arquivo salvo..."):
+                            df_data = load_dataframe_from_storage(selected_file)
+                            st.session_state["df_data"] = df_data
+                            st.session_state["loaded_file_id"] = selected_file_id
                         schema_text = describe_dataframe_schema(df_data)
-                    elif 'df_data' in st.session_state:
+                    elif selected_file is not None and 'df_data' in st.session_state:
+                        df_data = st.session_state['df_data'];
+                        schema_text = describe_dataframe_schema(df_data)
+                    elif 'df_data' in st.session_state and st.session_state.get("loaded_file_id"):
                         df_data = st.session_state['df_data'];
                         schema_text = describe_dataframe_schema(df_data)
                     else:
-                        st.info("Faça upload de um arquivo para começar.")
+                        st.info("Faça upload de um arquivo ou selecione um salvo para começar.")
             except Exception as e:
                 st.error(f"Falha ao carregar fonte de dados: {e}")
 
@@ -490,7 +535,7 @@ else:
                 with st.chat_message(message["role"], avatar=av): st.markdown(message["content"])
 
             if prompt := st.chat_input("Pergunte algo sobre seus dados..."):
-                st.session_state.history.append({"role": "user", "content": prompt})
+                append_chat_message("user", prompt)
                 with st.chat_message("user", avatar=AVATAR_USER):
                     st.markdown(prompt)
 
@@ -609,7 +654,7 @@ else:
                                         if not df_result.empty:
                                             st.subheader("Preview dos dados retornados")
                                             st.dataframe(df_result.head(100))
-                                        st.session_state.history.append({"role": "assistant", "content": final_text})
+                                        append_chat_message("assistant", final_text)
                                         response_handled_internally = True
                                     else:
                                         final_text = "Desculpe, não consegui processar essa consulta. Tente reformular sua pergunta de forma mais específica."
@@ -617,7 +662,7 @@ else:
                                             st.caption(f"Detalhe técnico: {last_error}")
                         if not response_handled_internally:
                             st.markdown(final_text)
-                            st.session_state.history.append({"role": "assistant", "content": final_text})
+                            append_chat_message("assistant", final_text)
 
     with tab2:
         st.header("Dashboard Interativo")
@@ -627,7 +672,13 @@ else:
             st.session_state.get('df_data', pd.DataFrame()))
         schema_dict_ctx = st.session_state.get('schema_dict') if db_mode_dash else None
         df_data_ctx = st.session_state.get('df_data') if not db_mode_dash else None
-        uri_ctx = f"postgresql+psycopg2://{st.session_state.db_creds['user']}:{st.session_state.db_creds['password']}@{st.session_state.db_creds['host']}:{st.session_state.db_creds['port']}/{st.session_state.db_creds['dbname']}" if db_mode_dash and 'db_creds' in st.session_state else None
+        db_creds_dash = st.session_state.get("db_creds", {})
+        uri_ctx = None
+        if db_mode_dash and has_complete_db_credentials(db_creds_dash):
+            uri_ctx = (
+                f"postgresql+psycopg2://{db_creds_dash['user']}:{db_creds_dash['password']}"
+                f"@{db_creds_dash['host']}:{db_creds_dash['port']}/{db_creds_dash['dbname']}"
+            )
         for idx, chart in enumerate(st.session_state.charts):
             st.subheader(chart.get("title", f"Gráfico {idx + 1}"));
             render_chart(chart)
@@ -709,5 +760,5 @@ else:
                 role = "Usuário" if msg["role"] == "user" else "Assistente"
                 with st.expander(f"{role} - Mensagem {i + 1}"): st.markdown(msg["content"])
             if st.button("Limpar Histórico"):
-                st.session_state.history = [];
+                clear_chat_history()
                 st.rerun()

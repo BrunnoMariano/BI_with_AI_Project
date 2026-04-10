@@ -69,6 +69,9 @@ def restore_user_session(user: dict):
     st.session_state.pop("connected_uri", None)
     st.session_state.pop("schema_text", None)
     st.session_state.pop("schema_dict", None)
+    st.session_state.pop("file_prompt_context", None)
+    st.session_state.pop("file_schema_dict", None)
+    st.session_state.pop("dataset_profile", None)
 
 
 def get_user_config(user_id: str):
@@ -182,6 +185,11 @@ def save_uploaded_file(uploaded_file) -> dict:
     current_files.append(file_record)
     st.session_state["user_files"] = _sort_by_timestamp(current_files, "uploaded_at")
     st.session_state["selected_file_id"] = file_record["file_id"]
+    st.session_state.pop("df_data", None)
+    st.session_state.pop("loaded_file_id", None)
+    st.session_state.pop("file_prompt_context", None)
+    st.session_state.pop("file_schema_dict", None)
+    st.session_state.pop("dataset_profile", None)
     return file_record
 
 

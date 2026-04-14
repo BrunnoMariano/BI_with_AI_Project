@@ -1,10 +1,66 @@
-.venv/
+# ------------------------------
+# Python
+# ------------------------------
 __pycache__/
-*.pyc
-.streamlit/
-.env
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+
+# Virtual environments
+.venv/
+venv/
+env/
+ENV/
+
+# Test and tool caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+.coverage.*
+htmlcov/
+
+# Jupyter
 .ipynb_checkpoints/
+
+# ------------------------------
+# Streamlit and local secrets
+# ------------------------------
+.streamlit/secrets.toml
+!.streamlit/config.toml
+.env
+.env.*
+!.env.example
+
+# ------------------------------
+# Frontend dependencies / local build caches
+# Keep the frontend source files and bundle.js versioned,
+# but ignore installed dependencies and package manager logs.
+# ------------------------------
+node_modules/
+fonte/dashboard_canvas_component/frontend/node_modules/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ------------------------------
+# OS / editor noise
+# ------------------------------
 .DS_Store
+Thumbs.db
+*.swp
+*.swo
+
+# ------------------------------
+# Logs
+# ------------------------------
 *.log
-Docs
+
+# ------------------------------
+# Project-local folders
+# ------------------------------
+Docs/
 .codex
+.codex/

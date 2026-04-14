@@ -1,0 +1,354 @@
+<!DOCTYPE html>
+<html lang="en">
+  <head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Dashboard Canvas</title>
+    <style>
+      :root {
+        --canvas-bg: rgba(14, 18, 24, 0.7);
+        --canvas-line: rgba(255, 255, 255, 0.08);
+        --card-bg: linear-gradient(180deg, rgba(25, 31, 40, 0.94), rgba(16, 21, 28, 0.92));
+        --card-border: rgba(255, 255, 255, 0.08);
+        --card-border-strong: rgba(255, 255, 255, 0.18);
+        --text-primary: #f5f7fb;
+        --text-secondary: #b7c1d1;
+        --text-muted: #8090a7;
+        --accent: #dce5f2;
+        --danger: #f6b7b7;
+      }
+
+      html,
+      body {
+        margin: 0;
+        padding: 0;
+        background: transparent;
+        color: var(--text-primary);
+        font-family: "Plus Jakarta Sans", "Segoe UI", sans-serif;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      #root {
+        min-height: 200px;
+        border-radius: 30px;
+        overflow: hidden;
+      }
+
+      .canvas-shell {
+        min-height: 420px;
+        border-radius: 30px;
+        overflow: hidden;
+        border: 1px dashed var(--canvas-line);
+        background:
+          linear-gradient(180deg, rgba(255, 255, 255, 0.022), transparent 30%),
+          radial-gradient(circle at top left, rgba(162, 184, 213, 0.08), transparent 28%),
+          radial-gradient(circle at bottom right, rgba(120, 137, 161, 0.06), transparent 22%),
+          var(--canvas-bg);
+        padding: 22px;
+        box-shadow:
+          inset 0 1px 0 rgba(255, 255, 255, 0.025),
+          0 18px 48px rgba(0, 0, 0, 0.18);
+      }
+
+      .canvas-empty {
+        min-height: 360px;
+        border-radius: 22px;
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 10px;
+        text-align: center;
+        color: var(--text-secondary);
+        background:
+          radial-gradient(circle at top center, rgba(255, 255, 255, 0.018), transparent 34%),
+          linear-gradient(180deg, rgba(255, 255, 255, 0.012), transparent 38%),
+          rgba(9, 13, 18, 0.42);
+      }
+
+      .canvas-empty strong {
+        color: var(--text-primary);
+        font-size: 1.08rem;
+        font-weight: 800;
+        letter-spacing: -0.03em;
+      }
+
+      .canvas-empty div {
+        max-width: 34rem;
+        color: #b8c4d6;
+        line-height: 1.6;
+      }
+
+      .react-grid-item {
+        transition: none !important;
+        will-change: transform, width, height;
+        backface-visibility: hidden;
+      }
+
+      .react-grid-layout {
+        min-height: 380px;
+        background: transparent !important;
+      }
+
+      .react-grid-item.react-grid-placeholder {
+        background: rgba(220, 229, 242, 0.12);
+        border: 1px dashed rgba(220, 229, 242, 0.26);
+        border-radius: 22px;
+      }
+
+      .react-resizable {
+        position: relative;
+      }
+
+      .canvas-card {
+        width: 100%;
+        height: 100%;
+        border-radius: 22px;
+        border: 1px solid var(--card-border);
+        background: var(--card-bg);
+        overflow: hidden;
+        display: flex;
+        flex-direction: column;
+        box-shadow: 0 18px 46px rgba(0, 0, 0, 0.26);
+        contain: paint;
+        transform: translateZ(0);
+      }
+
+      .canvas-card.selected {
+        border-color: rgba(220, 229, 242, 0.46);
+        box-shadow:
+          0 0 0 2px rgba(220, 229, 242, 0.18),
+          0 0 0 6px rgba(220, 229, 242, 0.05),
+          0 22px 54px rgba(0, 0, 0, 0.32);
+      }
+
+      .card-header {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 12px 14px 10px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        background: rgba(255, 255, 255, 0.02);
+        cursor: grab;
+        user-select: none;
+      }
+
+      .card-header:active {
+        cursor: grabbing;
+      }
+
+      .card-title-wrap {
+        min-width: 0;
+        flex: 1 1 auto;
+      }
+
+      .card-kicker {
+        display: block;
+        font-size: 0.68rem;
+        color: var(--text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.16em;
+        margin-bottom: 4px;
+      }
+
+      .card-title {
+        color: var(--text-primary);
+        font-weight: 700;
+        white-space: nowrap;
+        overflow: hidden;
+        text-overflow: ellipsis;
+      }
+
+      .card-title-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        min-width: 0;
+        width: 100%;
+      }
+
+      .card-selected-dot {
+        flex: 0 0 auto;
+        width: 8px;
+        height: 8px;
+        border-radius: 999px;
+        background: rgba(220, 229, 242, 0.94);
+        box-shadow:
+          0 0 0 1px rgba(255, 255, 255, 0.08),
+          0 0 12px rgba(220, 229, 242, 0.35);
+      }
+
+      .card-actions {
+        display: flex;
+        align-items: center;
+        gap: 6px;
+        flex: 0 0 auto;
+        position: relative;
+        z-index: 4;
+        margin-left: auto;
+      }
+
+      .card-drag-grip {
+        display: inline-flex;
+        align-items: center;
+        gap: 4px;
+        flex: 0 0 auto;
+        opacity: 0.7;
+        margin-left: 4px;
+        margin-right: 2px;
+        pointer-events: none;
+      }
+
+      .card-drag-grip span {
+        width: 4px;
+        height: 18px;
+        border-radius: 999px;
+        background:
+          linear-gradient(180deg, rgba(255, 255, 255, 0.42), rgba(255, 255, 255, 0.12));
+        box-shadow: inset 0 1px 0 rgba(255, 255, 255, 0.14);
+      }
+
+      .card-action {
+        height: 28px;
+        min-width: 28px;
+        padding: 0 10px;
+        border-radius: 999px;
+        border: 1px solid rgba(255, 255, 255, 0.08);
+        background: rgba(255, 255, 255, 0.04);
+        color: var(--text-secondary);
+        cursor: pointer;
+        font-size: 0.74rem;
+        font-weight: 700;
+      }
+
+      .card-action:hover {
+        color: var(--text-primary);
+        border-color: rgba(255, 255, 255, 0.16);
+        background: rgba(255, 255, 255, 0.08);
+      }
+
+      .card-action.danger:hover {
+        color: var(--danger);
+      }
+
+      .card-body {
+        flex: 1 1 auto;
+        min-height: 0;
+        padding: 10px 12px 12px;
+        display: flex;
+      }
+
+      .chart-slot,
+      .table-slot,
+      .kpi-slot,
+      .message-slot {
+        width: 100%;
+        height: 100%;
+        min-height: 0;
+        transform: translateZ(0);
+      }
+
+      .table-slot {
+        overflow: auto;
+        border-radius: 16px;
+        border: 1px solid rgba(255, 255, 255, 0.06);
+        background: rgba(7, 10, 15, 0.52);
+      }
+
+      table.dashboard-table {
+        width: 100%;
+        border-collapse: collapse;
+        color: var(--text-secondary);
+        font-size: 0.84rem;
+      }
+
+      table.dashboard-table th,
+      table.dashboard-table td {
+        padding: 10px 12px;
+        border-bottom: 1px solid rgba(255, 255, 255, 0.06);
+        text-align: left;
+        vertical-align: top;
+      }
+
+      table.dashboard-table th {
+        position: sticky;
+        top: 0;
+        background: rgba(11, 15, 21, 0.96);
+        color: var(--text-primary);
+        font-weight: 700;
+      }
+
+      .kpi-slot {
+        display: flex;
+        flex-direction: column;
+        justify-content: center;
+        gap: 10px;
+        padding: 8px;
+      }
+
+      .kpi-label {
+        color: var(--text-muted);
+        text-transform: uppercase;
+        letter-spacing: 0.16em;
+        font-size: 0.72rem;
+      }
+
+      .kpi-value {
+        color: var(--text-primary);
+        font-size: clamp(1.8rem, 3vw, 3rem);
+        font-weight: 800;
+        line-height: 1;
+      }
+
+      .message-slot {
+        display: flex;
+        align-items: center;
+        justify-content: center;
+        text-align: center;
+        color: var(--text-secondary);
+        border-radius: 16px;
+        border: 1px dashed rgba(255, 255, 255, 0.08);
+        background: rgba(7, 10, 15, 0.44);
+        padding: 16px;
+      }
+
+      .react-resizable-handle::after {
+        border-color: rgba(255, 255, 255, 0.48) !important;
+      }
+
+      .react-resizable-handle {
+        position: absolute;
+        width: 22px;
+        height: 22px;
+        right: 6px;
+        bottom: 6px;
+        cursor: se-resize;
+        overflow: hidden;
+        border-bottom-right-radius: 10px;
+        z-index: 3;
+      }
+
+      .react-resizable-handle::after {
+        content: "";
+        position: absolute;
+        right: 2px;
+        bottom: 2px;
+        width: 11px;
+        height: 11px;
+        background:
+          linear-gradient(135deg, transparent 0 45%, rgba(255, 255, 255, 0.46) 45% 53%, transparent 53% 100%),
+          linear-gradient(135deg, transparent 0 62%, rgba(255, 255, 255, 0.34) 62% 70%, transparent 70% 100%),
+          linear-gradient(135deg, transparent 0 79%, rgba(255, 255, 255, 0.24) 79% 87%, transparent 87% 100%);
+        opacity: 0.95;
+      }
+    </style>
+  </head>
+  <body>
+    <div id="root"></div>
+    <script src="./bundle.js"></script>
+  </body>
+</html>

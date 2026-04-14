@@ -203,3 +203,34 @@ def load_dataframe_from_storage(file_record: dict) -> pd.DataFrame:
     if file_name.endswith(".xlsx") or file_name.endswith(".xls"):
         return pd.read_excel(buffer)
     raise ValueError("Formato de arquivo nao suportado. Use CSV ou Excel.")
+
+
+def get_dashboard_record(dashboard_id: str, user_id: str | None = None) -> dict | None:
+    """Busca um dashboard persistido do usuario."""
+    uid = _get_user_id(user_id)
+    document = get_document(f"users/{uid}/dashboards/{dashboard_id}", _get_id_token())
+    if not document:
+        return None
+    document.pop("_document_name", None)
+    return document
+
+
+def save_dashboard_record(dashboard_id: str, payload: dict, user_id: str | None = None) -> dict:
+    """Salva um dashboard do usuario no Firestore."""
+    uid = _get_user_id(user_id)
+    data = dict(payload)
+    data["dashboard_id"] = dashboard_id
+    data["updated_at"] = build_message_record("system", "dashboard")["created_at"]
+    record = set_document(
+        f"users/{uid}/dashboards/{dashboard_id}",
+        data,
+        _get_id_token(),
+    )
+    record.pop("_document_name", None)
+    return record
+
+
+def delete_dashboard_record(dashboard_id: str, user_id: str | None = None) -> None:
+    """Remove um dashboard persistido do usuario."""
+    uid = _get_user_id(user_id)
+    delete_document(f"users/{uid}/dashboards/{dashboard_id}", _get_id_token())

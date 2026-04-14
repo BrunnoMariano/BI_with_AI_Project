@@ -4,6 +4,23 @@ import pandas as pd
 import plotly.express as px
 import re
 from sqlalchemy import create_engine, text
+from dashboard_canvas_component import dashboard_canvas_component
+from dashboard_service import (
+    build_dashboard_item,
+    build_echarts_spec,
+    build_render_items,
+    build_source_descriptor,
+    delete_dashboard_item,
+    duplicate_dashboard_item,
+    generate_visual_instructions,
+    load_dashboard,
+    parse_visual_instructions,
+    reset_dashboard_layouts,
+    run_visual_query,
+    save_dashboard,
+    update_dashboard_layouts,
+    upsert_dashboard_item,
+)
 from login_interface import show_login_page, show_logout_button
 from db_utils import introspect_schema
 from openai import OpenAI
@@ -649,6 +666,101 @@ def has_complete_db_credentials(credentials):
     return isinstance(credentials, dict) and all(credentials.get(key) for key in required_keys)
 
 
+def set_dashboard_editor(mode="create", item=None):
+    st.session_state["dashboard_editor_pending"] = {
+        "mode": mode,
+        "selected_item_id": item.get("chart_id") if item else None,
+        "prompt": item.get("prompt", "") if item else "",
+        "title": item.get("title", "") if item else "",
+    }
+
+
+def clear_dashboard_feedback():
+    st.session_state.pop("dashboard_feedback", None)
+
+
+def _get_dashboard_layout_drafts() -> dict:
+    return st.session_state.setdefault("dashboard_layout_drafts", {})
+
+
+def get_dashboard_layout_draft(source_key: str) -> dict | None:
+    return _get_dashboard_layout_drafts().get(source_key)
+
+
+def set_dashboard_layout_draft(source_key: str, layouts: dict) -> None:
+    _get_dashboard_layout_drafts()[source_key] = layouts
+
+
+def clear_dashboard_layout_draft(source_key: str) -> None:
+    _get_dashboard_layout_drafts().pop(source_key, None)
+
+
+def apply_dashboard_editor_pending():
+    pending = st.session_state.pop("dashboard_editor_pending", None)
+    if not pending:
+        return
+    st.session_state["dashboard_editor_mode"] = pending.get("mode", "create")
+    st.session_state["dashboard_selected_item_id"] = pending.get("selected_item_id")
+    st.session_state["dashboard_form_prompt"] = pending.get("prompt", "")
+    st.session_state["dashboard_form_title"] = pending.get("title", "")
+
+
+def build_dashboard_visual_item(
+    client,
+    model_name,
+    schema_text,
+    prompt,
+    title_override,
+    db_mode,
+    profile,
+    df_preview,
+    schema_dict,
+    uri,
+    df_data,
+):
+    instructions_text = generate_visual_instructions(
+        client,
+        model_name,
+        schema_text,
+        prompt,
+        db_mode,
+        profile,
+        df_preview,
+    )
+    visual_spec = parse_visual_instructions(instructions_text)
+    valid, message, query_text = validate_sql_tables(visual_spec.get("query_text", ""), db_mode, schema_dict)
+    if not valid:
+        raise ValueError(message)
+
+    visual_spec["query_text"] = query_text
+    sql_system_prompt = build_sql_system_prompt(db_mode, profile)
+    last_error = None
+
+    for attempt in range(2):
+        try:
+            df_result = run_visual_query(query_text, db_mode=db_mode, uri=uri, df_data=df_data)
+            echarts_spec = build_echarts_spec(df_result, visual_spec)
+            return build_dashboard_item(
+                prompt=prompt,
+                visual_spec=visual_spec,
+                echarts_spec=echarts_spec,
+                title_override=title_override,
+            )
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt == 1:
+                break
+            fix_prompt = build_sql_fix_prompt(last_error, query_text, prompt, db_mode, profile)
+            sql_candidate = generate_sql(client, model_name, sql_system_prompt, schema_text, "", fix_prompt)
+            query_text = extract_sql(sql_candidate)
+            valid, message, query_text = validate_sql_tables(query_text, db_mode, schema_dict)
+            if not valid:
+                raise ValueError(message)
+            visual_spec["query_text"] = query_text
+
+    raise ValueError(last_error or "Não foi possível montar o visual.")
+
+
 # Verificação de Autenticação
 if not st.session_state.get('logged_in', False):
     show_login_page()
@@ -955,14 +1067,17 @@ else:
 
     with tab2:
         render_section_intro(
-            "DATA ANALYTICS",
-            "",
-            "",
+            "Dashboard",
+            "Canvas interativo de visuais",
+            "Monte seu painel, mova os cards e edite cada visual sem sair da tela.",
         )
-        if 'charts' not in st.session_state: st.session_state.charts = []
         db_mode_dash = (fonte_dados == "Banco de Dados")
         file_profile_ctx = st.session_state.get("dataset_profile", {"profile_id": "generic_file_v1"})
         file_df_ctx = st.session_state.get('df_data', pd.DataFrame())
+        user_files_ctx = st.session_state.get("user_files", [])
+        selected_file_id = st.session_state.get("selected_file_id")
+        selected_file_ctx = next((file for file in user_files_ctx if file["file_id"] == selected_file_id), None)
+        selected_file_name = selected_file_ctx.get("name", "") if selected_file_ctx else ""
         schema_text_ctx = st.session_state.get('schema_text', '') if db_mode_dash else st.session_state.get(
             "file_prompt_context",
             build_prompt_context(file_df_ctx, file_profile_ctx),
@@ -979,80 +1094,209 @@ else:
                 f"postgresql+psycopg2://{db_creds_dash['user']}:{db_creds_dash['password']}"
                 f"@{db_creds_dash['host']}:{db_creds_dash['port']}/{db_creds_dash['dbname']}"
             )
-        for idx, chart in enumerate(st.session_state.charts):
-            st.markdown(
-                f"<p class='ui-section-label'>Visualização {idx + 1}</p><h3 style='margin-top:0;'>{chart.get('title', f'Gráfico {idx + 1}')}</h3>",
-                unsafe_allow_html=True,
+        if "dashboard_editor_mode" not in st.session_state:
+            set_dashboard_editor("create")
+        apply_dashboard_editor_pending()
+
+        source_descriptor = build_source_descriptor(
+            db_mode_dash,
+            db_creds=db_creds_dash,
+            selected_file_id=selected_file_id,
+            selected_file_name=selected_file_name,
+        )
+
+        feedback = st.session_state.get("dashboard_feedback")
+        if feedback:
+            if feedback.get("type") == "success":
+                st.success(feedback.get("message", "Operação concluída."))
+            elif feedback.get("type") == "warning":
+                st.warning(feedback.get("message", "Atenção."))
+            else:
+                st.info(feedback.get("message", "Atualizado."))
+            clear_dashboard_feedback()
+
+        if not source_descriptor:
+            st.info("Configure a fonte de dados para habilitar o novo Dashboard.")
+        else:
+            user = st.session_state.get("user", {})
+            dashboard_record = load_dashboard(
+                user.get("user_id", ""),
+                source_descriptor["source_key"],
+                source_descriptor["source_type"],
+                source_descriptor["source_label"],
             )
-            render_chart(chart)
-            with st.expander(f"Opções para Gráfico {idx + 1}"):
-                edit_prompt = st.text_input("Refine ou altere este gráfico:", key=f"edit_{idx}")
-                col1, col2 = st.columns(2)
-                with col1:
-                    if st.button("Atualizar Gráfico", key=f"update_{idx}"):
-                        if edit_prompt.strip() and openai_api_key:
-                            with st.spinner("Atualizando gráfico..."):
-                                try:
-                                    client = OpenAI(api_key=openai_api_key)
-                                    instr_text = generate_chart_instructions(client, modelo_selecionado,
-                                                                             schema_text_ctx, edit_prompt, db_mode_dash,
-                                                                             file_profile_ctx, df_data_ctx)
-                                    new_chart_cfg = parse_chart_instructions(instr_text);
-                                    valid, msg, new_sql = validate_sql_tables(new_chart_cfg["sql"], db_mode_dash, schema_dict_ctx)
-                                    new_chart_cfg["sql"] = new_sql
-                                    if not valid:
-                                        st.error(msg)
-                                    else:
-                                        if db_mode_dash and uri_ctx:
-                                            engine = create_engine(uri_ctx);
-                                            df_result = pd.read_sql(text(new_chart_cfg["sql"]), engine)
-                                        elif not db_mode_dash and df_data_ctx is not None:
-                                            df_result = ps.sqldf(new_chart_cfg["sql"], {"df": df_data_ctx})
-                                        else:
-                                            df_result = pd.DataFrame()
-                                        if not df_result.empty:
-                                            new_chart_cfg["df"] = df_result;
-                                            st.session_state.charts[idx] = new_chart_cfg;
-                                            st.rerun()
-                                        else:
-                                            st.warning("A nova consulta para o gráfico não retornou dados.")
-                                except Exception as e:
-                                    st.error(f"Erro ao atualizar gráfico: {e}")
-                with col2:
-                    if st.button("Remover Gráfico", type="primary", key=f"remove_{idx}"):
-                        st.session_state.charts.pop(idx);
+            layout_draft = get_dashboard_layout_draft(source_descriptor["source_key"])
+            if layout_draft:
+                dashboard_record = update_dashboard_layouts(dashboard_record, layout_draft)
+            render_items = build_render_items(dashboard_record, db_mode_dash, uri=uri_ctx, df_data=df_data_ctx)
+            layout_has_pending_changes = layout_draft is not None
+
+            toolbar_cols = st.columns([1.15, 1, 1, 1.2, 1.65])
+            with toolbar_cols[0]:
+                if st.button("Adicionar visual", use_container_width=True):
+                    set_dashboard_editor("create")
+                    st.rerun()
+            with toolbar_cols[1]:
+                if st.button("Salvar layout", use_container_width=True):
+                    save_dashboard(user.get("user_id", ""), source_descriptor["source_key"], dashboard_record)
+                    clear_dashboard_layout_draft(source_descriptor["source_key"])
+                    st.session_state["dashboard_feedback"] = {"type": "success", "message": "Layout salvo com sucesso."}
+                    st.rerun()
+            with toolbar_cols[2]:
+                if st.button("Restaurar layout", use_container_width=True):
+                    dashboard_record = reset_dashboard_layouts(dashboard_record)
+                    save_dashboard(user.get("user_id", ""), source_descriptor["source_key"], dashboard_record)
+                    clear_dashboard_layout_draft(source_descriptor["source_key"])
+                    st.session_state["dashboard_feedback"] = {"type": "info", "message": "Layout restaurado para o padrão."}
+                    st.rerun()
+            selected_item_id = st.session_state.get("dashboard_selected_item_id")
+            selected_record_item = next((item for item in dashboard_record.get("items", []) if item.get("chart_id") == selected_item_id), None)
+            selected_item_label = selected_record_item.get("title", "Visual selecionado") if selected_record_item else "Nenhum visual selecionado"
+            with toolbar_cols[3]:
+                duplicate_disabled = selected_record_item is None
+                if st.button("Duplicar selecionado", use_container_width=True, disabled=duplicate_disabled):
+                    dashboard_record = duplicate_dashboard_item(dashboard_record, selected_item_id)
+                    save_dashboard(user.get("user_id", ""), source_descriptor["source_key"], dashboard_record)
+                    clear_dashboard_layout_draft(source_descriptor["source_key"])
+                    st.session_state["dashboard_feedback"] = {"type": "success", "message": "Visual duplicado no canvas."}
+                    st.rerun()
+            with toolbar_cols[4]:
+                layout_status = "Alterações de layout pendentes" if layout_has_pending_changes else "Layout sincronizado"
+                st.markdown(
+                    f"<p class='ui-section-label' style='margin-bottom:0.2rem;'>Fonte ativa</p><p style='margin:0 0 0.45rem;color:#d7deea;font-weight:600;'>{source_descriptor['source_label']}</p><p class='ui-section-label' style='margin-bottom:0.2rem;'>Selecionado</p><p style='margin:0 0 0.45rem;color:#f5f7fb;font-weight:700;'>{selected_item_label}</p><p class='ui-section-label' style='margin-bottom:0.2rem;'>Layout</p><p style='margin:0;color:{'#f6d48b' if layout_has_pending_changes else '#b8c7da'};font-weight:600;'>{layout_status}</p>",
+                    unsafe_allow_html=True,
+                )
+
+            canvas_col, panel_col = st.columns([3.35, 1.35], gap="large")
+            with canvas_col:
+                canvas_event = dashboard_canvas_component(
+                    items=render_items,
+                    layouts=dashboard_record.get("layouts", {}),
+                    selected_item_id=selected_item_id,
+                    editable=True,
+                    key=f"dashboard_canvas_{source_descriptor['source_key']}",
+                )
+
+            if canvas_event and canvas_event.get("event_id") != st.session_state.get("dashboard_last_event_id"):
+                st.session_state["dashboard_last_event_id"] = canvas_event.get("event_id")
+                event_type = canvas_event.get("event_type")
+                event_selected_id = canvas_event.get("selected_item_id")
+                st.session_state["dashboard_selected_item_id"] = event_selected_id
+                if event_type == "layout_change":
+                    dashboard_record = update_dashboard_layouts(dashboard_record, canvas_event.get("layouts", {}))
+                    set_dashboard_layout_draft(source_descriptor["source_key"], dashboard_record.get("layouts", {}))
+                if event_type == "select":
+                    if event_selected_id is None and st.session_state.get("dashboard_editor_mode") == "edit":
+                        set_dashboard_editor("create")
+                    st.rerun()
+                if event_type == "item_action":
+                    action = canvas_event.get("item_action", {})
+                    action_type = action.get("type")
+                    action_chart_id = action.get("chart_id")
+                    action_item = next((item for item in dashboard_record.get("items", []) if item.get("chart_id") == action_chart_id), None)
+                    if action_type == "edit" and action_item:
+                        set_dashboard_editor("edit", action_item)
                         st.rerun()
-        st.markdown("<h3 style='margin-top:0;'>Adicionar novo gráfico</h3>", unsafe_allow_html=True)
-        new_chart_prompt = st.text_input("Descreva o gráfico que você deseja criar:", key="new_chart_prompt_input")
-        if st.button("Gerar novo gráfico", key="new_chart_btn"):
-            if new_chart_prompt.strip() and openai_api_key:
-                with st.spinner("Gerando gráfico..."):
-                    try:
-                        client = OpenAI(api_key=openai_api_key)
-                        instr_text = generate_chart_instructions(client, modelo_selecionado, schema_text_ctx,
-                                                                 new_chart_prompt, db_mode_dash, file_profile_ctx, df_data_ctx)
-                        chart_cfg = parse_chart_instructions(instr_text);
-                        valid, msg, new_sql = validate_sql_tables(chart_cfg["sql"], db_mode_dash, schema_dict_ctx)
-                        chart_cfg["sql"] = new_sql
-                        if not valid:
-                            st.error(msg)
-                        else:
-                            if db_mode_dash and uri_ctx:
-                                engine = create_engine(uri_ctx);
-                                df_result = pd.read_sql(text(chart_cfg["sql"]), engine)
-                            elif not db_mode_dash and df_data_ctx is not None:
-                                df_result = ps.sqldf(chart_cfg["sql"], {"df": df_data_ctx})
-                            else:
-                                st.warning("Fonte de dados não está pronta.");
-                                df_result = pd.DataFrame()
-                            if not df_result.empty:
-                                chart_cfg["df"] = df_result;
-                                st.session_state.charts.append(chart_cfg);
+                    if action_type == "duplicate" and action_chart_id:
+                        dashboard_record = duplicate_dashboard_item(dashboard_record, action_chart_id)
+                        save_dashboard(user.get("user_id", ""), source_descriptor["source_key"], dashboard_record)
+                        clear_dashboard_layout_draft(source_descriptor["source_key"])
+                        st.session_state["dashboard_feedback"] = {"type": "success", "message": "Visual duplicado no canvas."}
+                        st.rerun()
+                    if action_type == "remove" and action_chart_id:
+                        dashboard_record = delete_dashboard_item(dashboard_record, action_chart_id)
+                        save_dashboard(user.get("user_id", ""), source_descriptor["source_key"], dashboard_record)
+                        clear_dashboard_layout_draft(source_descriptor["source_key"])
+                        if st.session_state.get("dashboard_selected_item_id") == action_chart_id:
+                            set_dashboard_editor("create")
+                        st.session_state["dashboard_feedback"] = {"type": "info", "message": "Visual removido do dashboard."}
+                        st.rerun()
+
+            with panel_col:
+                current_selected_id = st.session_state.get("dashboard_selected_item_id")
+                current_item = next((item for item in dashboard_record.get("items", []) if item.get("chart_id") == current_selected_id), None)
+                editor_mode = st.session_state.get("dashboard_editor_mode", "create")
+                if editor_mode == "edit" and current_item is None:
+                    set_dashboard_editor("create")
+                    editor_mode = "create"
+
+                if editor_mode == "edit" and current_item:
+                    st.markdown(
+                        "<p class='ui-section-label'>Editor</p><h3 style='margin-top:0;'>Editar visual</h3>",
+                        unsafe_allow_html=True,
+                    )
+                    st.caption(f"Visual ativo: {current_item.get('title', 'Visual selecionado')}. Atualize o prompt ou o título sem perder a posição.")
+                    if st.button("Criar novo visual", use_container_width=True):
+                        set_dashboard_editor("create")
+                        st.rerun()
+                else:
+                    st.markdown(
+                        "<p class='ui-section-label'>Criação</p><h3 style='margin-top:0;'>Adicionar visual</h3>",
+                        unsafe_allow_html=True,
+                    )
+                    st.caption("Descreva o visual desejado e ele será criado diretamente no canvas.")
+
+                with st.form("dashboard_visual_form"):
+                    st.text_input("Título do visual", key="dashboard_form_title")
+                    st.text_area(
+                        "Prompt do visual",
+                        key="dashboard_form_prompt",
+                        height=180,
+                        placeholder="Ex.: compare o faturamento por mês em um gráfico de linha",
+                    )
+                    submitted = st.form_submit_button("Atualizar visual" if editor_mode == "edit" else "Gerar visual")
+
+                if submitted:
+                    form_prompt = st.session_state.get("dashboard_form_prompt", "").strip()
+                    title_override = st.session_state.get("dashboard_form_title", "").strip()
+                    if not form_prompt:
+                        st.warning("Descreva o visual antes de gerar.")
+                    elif not openai_api_key:
+                        st.warning("Insira a chave OpenAI para criar ou editar visuais.")
+                    elif (db_mode_dash and not uri_ctx) or (not db_mode_dash and df_data_ctx is None):
+                        st.warning("A fonte de dados ainda não está pronta para o Dashboard.")
+                    else:
+                        with st.spinner("Montando o visual no canvas..."):
+                            try:
+                                client = OpenAI(api_key=openai_api_key)
+                                new_item = build_dashboard_visual_item(
+                                    client=client,
+                                    model_name=modelo_selecionado,
+                                    schema_text=schema_text_ctx,
+                                    prompt=form_prompt,
+                                    title_override=title_override,
+                                    db_mode=db_mode_dash,
+                                    profile=file_profile_ctx,
+                                    df_preview=df_data_ctx,
+                                    schema_dict=schema_dict_ctx,
+                                    uri=uri_ctx,
+                                    df_data=df_data_ctx,
+                                )
+                                if editor_mode == "edit" and current_item:
+                                    new_item["chart_id"] = current_item["chart_id"]
+                                    new_item["layout"] = current_item.get("layout", {})
+                                dashboard_record = upsert_dashboard_item(dashboard_record, new_item)
+                                save_dashboard(user.get("user_id", ""), source_descriptor["source_key"], dashboard_record)
+                                clear_dashboard_layout_draft(source_descriptor["source_key"])
+                                set_dashboard_editor("edit", new_item)
+                                st.session_state["dashboard_feedback"] = {
+                                    "type": "success",
+                                    "message": "Visual salvo e sincronizado com o canvas.",
+                                }
                                 st.rerun()
-                            else:
-                                st.warning("A consulta para o gráfico não retornou dados.")
-                    except Exception as e:
-                        st.error(f"Erro ao adicionar gráfico: {e}")
+                            except Exception as e:
+                                st.error(f"Erro ao montar o visual: {e}")
+
+                st.markdown("---")
+                st.markdown(
+                    "<p class='ui-section-label'>Dicas</p><h3 style='margin-top:0;'>Atalhos úteis</h3>",
+                    unsafe_allow_html=True,
+                )
+                st.markdown(
+                    "- Peça comparações por período, produto, cidade ou status.\n"
+                    "- Se quiser um card numérico, peça um KPI ou indicador.\n"
+                    "- Para análise tabular, peça explicitamente uma tabela."
+                )
 
     with tab3:
         render_section_intro(

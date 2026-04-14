@@ -238,6 +238,30 @@ p, label, span, div, small {
     padding: 1.1rem 1rem 0.85rem;
 }
 
+/* Streamlit custom components are mounted inside an iframe. The dashboard grid
+   already renders its own rounded shell, so the host iframe must stay visually invisible. */
+.element-container:has(> iframe[data-testid="stCustomComponentV1"]),
+.element-container div:has(> iframe[data-testid="stCustomComponentV1"]),
+[data-testid="stElementContainer"]:has(iframe[data-testid="stCustomComponentV1"]) {
+    background: transparent !important;
+    border: 0 !important;
+    box-shadow: none !important;
+    border-radius: 0 !important;
+    overflow: visible !important;
+}
+
+iframe[data-testid="stCustomComponentV1"],
+.stCustomComponentV1 {
+    display: block !important;
+    width: 100% !important;
+    border: 0 !important;
+    border-radius: var(--radius-xl) !important;
+    background: transparent !important;
+    box-shadow: none !important;
+    overflow: hidden !important;
+    clip-path: inset(0 round var(--radius-xl));
+}
+
 [data-testid="stVerticalBlock"] > [data-testid="stVerticalBlockBorderWrapper"] {
     border-radius: var(--radius-lg);
 }

@@ -6,19 +6,25 @@ import re
 from sqlalchemy import create_engine, text
 from dashboard_canvas_component import dashboard_canvas_component
 from dashboard_service import (
+    DASHBOARD_VISUAL_TYPES,
     build_dashboard_item,
+    build_dashboard_filter,
     build_echarts_spec,
     build_render_items,
     build_source_descriptor,
+    delete_dashboard_filter,
     delete_dashboard_item,
     duplicate_dashboard_item,
     generate_visual_instructions,
+    get_filter_value_options,
     load_dashboard,
     parse_visual_instructions,
     reset_dashboard_layouts,
     run_visual_query,
     save_dashboard,
+    update_dashboard_filter_values,
     update_dashboard_layouts,
+    upsert_dashboard_filter,
     upsert_dashboard_item,
 )
 from login_interface import show_login_page, show_logout_button
@@ -666,12 +672,42 @@ def has_complete_db_credentials(credentials):
     return isinstance(credentials, dict) and all(credentials.get(key) for key in required_keys)
 
 
+VISUAL_TYPE_LABELS = {
+    "bar": "Barras",
+    "line": "Linhas",
+    "area": "Área",
+    "pie": "Pizza",
+    "scatter": "Dispersão",
+    "table": "Tabela",
+    "kpi": "KPI",
+}
+VISUAL_TYPE_BY_LABEL = {label: value for value, label in VISUAL_TYPE_LABELS.items()}
+
+
+def build_dashboard_column_options(schema_dict, db_mode, df_data=None):
+    if db_mode:
+        options = []
+        for table_name, columns in (schema_dict or {}).items():
+            for column_name, _column_type in columns:
+                options.append(f"{table_name}.{column_name}")
+        return options
+    if df_data is not None and not df_data.empty:
+        return list(df_data.columns)
+    columns = []
+    for _table_name, table_columns in (schema_dict or {}).items():
+        columns.extend([column_name for column_name, _column_type in table_columns])
+    return columns
+
+
 def set_dashboard_editor(mode="create", item=None):
+    filter_behavior = item.get("filter_behavior", {}) if item else {}
     st.session_state["dashboard_editor_pending"] = {
         "mode": mode,
         "selected_item_id": item.get("chart_id") if item else None,
         "prompt": item.get("prompt", "") if item else "",
         "title": item.get("title", "") if item else "",
+        "visual_type": item.get("visual_type", "bar") if item else "bar",
+        "ignore_global_filters": bool(filter_behavior.get("ignore_global_filters", False)),
     }
 
 
@@ -703,6 +739,12 @@ def apply_dashboard_editor_pending():
     st.session_state["dashboard_selected_item_id"] = pending.get("selected_item_id")
     st.session_state["dashboard_form_prompt"] = pending.get("prompt", "")
     st.session_state["dashboard_form_title"] = pending.get("title", "")
+    st.session_state["dashboard_form_visual_type"] = pending.get("visual_type", "bar")
+    st.session_state["dashboard_form_visual_type_label"] = VISUAL_TYPE_LABELS.get(
+        pending.get("visual_type", "bar"),
+        "Barras",
+    )
+    st.session_state["dashboard_form_ignore_filters"] = pending.get("ignore_global_filters", False)
 
 
 def build_dashboard_visual_item(
@@ -711,6 +753,8 @@ def build_dashboard_visual_item(
     schema_text,
     prompt,
     title_override,
+    forced_visual_type,
+    filter_behavior,
     db_mode,
     profile,
     df_preview,
@@ -726,8 +770,10 @@ def build_dashboard_visual_item(
         db_mode,
         profile,
         df_preview,
+        forced_visual_type=forced_visual_type,
     )
     visual_spec = parse_visual_instructions(instructions_text)
+    visual_spec["visual_type"] = forced_visual_type if forced_visual_type in DASHBOARD_VISUAL_TYPES else "bar"
     valid, message, query_text = validate_sql_tables(visual_spec.get("query_text", ""), db_mode, schema_dict)
     if not valid:
         raise ValueError(message)
@@ -745,6 +791,7 @@ def build_dashboard_visual_item(
                 visual_spec=visual_spec,
                 echarts_spec=echarts_spec,
                 title_override=title_override,
+                filter_behavior=filter_behavior,
             )
         except Exception as exc:
             last_error = str(exc)
@@ -1128,8 +1175,17 @@ else:
             layout_draft = get_dashboard_layout_draft(source_descriptor["source_key"])
             if layout_draft:
                 dashboard_record = update_dashboard_layouts(dashboard_record, layout_draft)
-            render_items = build_render_items(dashboard_record, db_mode_dash, uri=uri_ctx, df_data=df_data_ctx)
             layout_has_pending_changes = layout_draft is not None
+            column_options = build_dashboard_column_options(schema_dict_ctx, db_mode_dash, df_data_ctx)
+            dashboard_filters = dashboard_record.get("filters", [])
+
+            render_items = build_render_items(
+                dashboard_record,
+                db_mode_dash,
+                uri=uri_ctx,
+                df_data=df_data_ctx,
+                active_filters=dashboard_record.get("filters", []),
+            )
 
             toolbar_cols = st.columns([1.15, 1, 1, 1.2, 1.65])
             with toolbar_cols[0]:
@@ -1169,6 +1225,44 @@ else:
 
             canvas_col, panel_col = st.columns([3.35, 1.35], gap="large")
             with canvas_col:
+                if dashboard_filters:
+                    st.markdown(
+                        "<p class='ui-section-label' style='margin-bottom:0.35rem;'>Filtros globais</p>",
+                        unsafe_allow_html=True,
+                    )
+                    filter_cols = st.columns(min(4, max(1, len(dashboard_filters))))
+                    next_filter_values = {}
+                    for filter_index, dashboard_filter in enumerate(dashboard_filters):
+                        filter_key = dashboard_filter.get("filter_id", f"filter_{filter_index}")
+                        options = get_filter_value_options(
+                            dashboard_filter,
+                            db_mode_dash,
+                            uri=uri_ctx,
+                            df_data=df_data_ctx,
+                        )
+                        selected_values = [value for value in dashboard_filter.get("selected_values", []) if value]
+                        merged_options = list(dict.fromkeys(selected_values + options))
+                        with filter_cols[filter_index % len(filter_cols)]:
+                            next_filter_values[filter_key] = st.multiselect(
+                                dashboard_filter.get("title") or dashboard_filter.get("column") or "Filtro",
+                                merged_options,
+                                default=selected_values,
+                                key=f"dashboard_filter_{source_descriptor['source_key']}_{filter_key}",
+                            )
+                    if any(
+                        next_filter_values.get(item.get("filter_id"), []) != item.get("selected_values", [])
+                        for item in dashboard_filters
+                    ):
+                        dashboard_record = update_dashboard_filter_values(dashboard_record, next_filter_values)
+                        save_dashboard(user.get("user_id", ""), source_descriptor["source_key"], dashboard_record)
+                        render_items = build_render_items(
+                            dashboard_record,
+                            db_mode_dash,
+                            uri=uri_ctx,
+                            df_data=df_data_ctx,
+                            active_filters=dashboard_record.get("filters", []),
+                        )
+
                 canvas_event = dashboard_canvas_component(
                     items=render_items,
                     layouts=dashboard_record.get("layouts", {}),
@@ -1225,7 +1319,7 @@ else:
                         "<p class='ui-section-label'>Editor</p><h3 style='margin-top:0;'>Editar visual</h3>",
                         unsafe_allow_html=True,
                     )
-                    st.caption(f"Visual ativo: {current_item.get('title', 'Visual selecionado')}. Atualize o prompt ou o título sem perder a posição.")
+                    st.caption(f"Visual ativo: {current_item.get('title', 'Visual selecionado')}. Atualize tipo, prompt ou título sem perder a posição.")
                     if st.button("Criar novo visual", use_container_width=True):
                         set_dashboard_editor("create")
                         st.rerun()
@@ -1234,21 +1328,36 @@ else:
                         "<p class='ui-section-label'>Criação</p><h3 style='margin-top:0;'>Adicionar visual</h3>",
                         unsafe_allow_html=True,
                     )
-                    st.caption("Descreva o visual desejado e ele será criado diretamente no canvas.")
+                    st.caption("Escolha o tipo, descreva o conteúdo e o visual será criado diretamente no canvas.")
 
                 with st.form("dashboard_visual_form"):
+                    visual_type_labels = list(VISUAL_TYPE_BY_LABEL.keys())
+                    current_visual_type = st.session_state.get("dashboard_form_visual_type", "bar")
+                    current_visual_label = VISUAL_TYPE_LABELS.get(current_visual_type, "Barras")
+                    selected_visual_label = st.selectbox(
+                        "Tipo do visual",
+                        visual_type_labels,
+                        index=visual_type_labels.index(current_visual_label) if current_visual_label in visual_type_labels else 0,
+                        key="dashboard_form_visual_type_label",
+                    )
                     st.text_input("Título do visual", key="dashboard_form_title")
                     st.text_area(
                         "Prompt do visual",
                         key="dashboard_form_prompt",
                         height=180,
-                        placeholder="Ex.: compare o faturamento por mês em um gráfico de linha",
+                        placeholder="Ex.: compare o faturamento por mês",
+                    )
+                    ignore_global_filters = st.checkbox(
+                        "Ignorar filtros globais neste visual",
+                        key="dashboard_form_ignore_filters",
                     )
                     submitted = st.form_submit_button("Atualizar visual" if editor_mode == "edit" else "Gerar visual")
 
                 if submitted:
                     form_prompt = st.session_state.get("dashboard_form_prompt", "").strip()
                     title_override = st.session_state.get("dashboard_form_title", "").strip()
+                    forced_visual_type = VISUAL_TYPE_BY_LABEL.get(selected_visual_label, "bar")
+                    filter_behavior = {"ignore_global_filters": bool(ignore_global_filters)}
                     if not form_prompt:
                         st.warning("Descreva o visual antes de gerar.")
                     elif not openai_api_key:
@@ -1265,6 +1374,8 @@ else:
                                     schema_text=schema_text_ctx,
                                     prompt=form_prompt,
                                     title_override=title_override,
+                                    forced_visual_type=forced_visual_type,
+                                    filter_behavior=filter_behavior,
                                     db_mode=db_mode_dash,
                                     profile=file_profile_ctx,
                                     df_preview=df_data_ctx,
@@ -1289,13 +1400,55 @@ else:
 
                 st.markdown("---")
                 st.markdown(
+                    "<p class='ui-section-label'>Segmentações</p><h3 style='margin-top:0;'>Filtros globais</h3>",
+                    unsafe_allow_html=True,
+                )
+                st.caption("Crie dropdowns globais por coluna para filtrar os visuais compatíveis do dashboard.")
+                if column_options:
+                    if dashboard_record.get("filters"):
+                        for dashboard_filter in dashboard_record.get("filters", []):
+                            filter_cols = st.columns([3, 1])
+                            with filter_cols[0]:
+                                st.markdown(
+                                    f"**{dashboard_filter.get('title', 'Filtro')}**  \n"
+                                    f"<span style='color:#9ba8ba;font-size:0.82rem;'>{dashboard_filter.get('column', '')}</span>",
+                                    unsafe_allow_html=True,
+                                )
+                            with filter_cols[1]:
+                                if st.button(
+                                    "Remover",
+                                    key=f"remove_dashboard_filter_{dashboard_filter.get('filter_id')}",
+                                    use_container_width=True,
+                                ):
+                                    dashboard_record = delete_dashboard_filter(dashboard_record, dashboard_filter.get("filter_id", ""))
+                                    save_dashboard(user.get("user_id", ""), source_descriptor["source_key"], dashboard_record)
+                                    st.session_state["dashboard_feedback"] = {"type": "info", "message": "Filtro global removido."}
+                                    st.rerun()
+
+                    with st.form("dashboard_filter_form"):
+                        filter_column = st.selectbox("Coluna para filtrar", column_options)
+                        filter_title = st.text_input("Nome do filtro", placeholder="Ex.: Produto, Cidade, Status")
+                        filter_submitted = st.form_submit_button("Adicionar filtro")
+
+                    if filter_submitted:
+                        new_filter = build_dashboard_filter(filter_title, filter_column)
+                        dashboard_record = upsert_dashboard_filter(dashboard_record, new_filter)
+                        save_dashboard(user.get("user_id", ""), source_descriptor["source_key"], dashboard_record)
+                        st.session_state["dashboard_feedback"] = {"type": "success", "message": "Filtro global adicionado."}
+                        st.rerun()
+                else:
+                    st.info("Carregue uma fonte com colunas disponíveis para criar filtros.")
+
+                st.markdown("---")
+                st.markdown(
                     "<p class='ui-section-label'>Dicas</p><h3 style='margin-top:0;'>Atalhos úteis</h3>",
                     unsafe_allow_html=True,
                 )
                 st.markdown(
+                    "- Escolha o tipo visual antes de descrever a análise.\n"
                     "- Peça comparações por período, produto, cidade ou status.\n"
                     "- Se quiser um card numérico, peça um KPI ou indicador.\n"
-                    "- Para análise tabular, peça explicitamente uma tabela."
+                    "- Use a opção de ignorar filtros para manter um visual como referência."
                 )
 
     with tab3:

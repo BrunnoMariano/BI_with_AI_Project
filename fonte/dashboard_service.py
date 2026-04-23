@@ -2,6 +2,7 @@ import copy
 import hashlib
 import json
 import math
+import re
 from typing import Any
 from uuid import uuid4
 
@@ -14,6 +15,8 @@ from user_data import get_dashboard_record, save_dashboard_record
 
 DASHBOARD_BREAKPOINT_COLS = {"lg": 24, "md": 12, "sm": 4}
 DASHBOARD_LAYOUT_DEFAULT = {"w": 8, "h": 6, "minW": 4, "minH": 4}
+DASHBOARD_VISUAL_TYPES = {"bar", "line", "area", "pie", "scatter", "table", "kpi"}
+DASHBOARD_FILTER_MARKER = "/*DASHBOARD_FILTERS*/"
 
 
 def build_source_descriptor(
@@ -56,6 +59,7 @@ def default_dashboard_record(source_type: str, source_key: str, source_label: st
         "source_key": source_key,
         "title": f"Dashboard - {source_label}",
         "items": [],
+        "filters": [],
         "layouts": {breakpoint: [] for breakpoint in DASHBOARD_BREAKPOINT_COLS},
     }
 
@@ -71,6 +75,8 @@ def load_dashboard(user_id: str, source_key: str, source_type: str, source_label
     record.setdefault("source_key", source_key)
     record.setdefault("title", f"Dashboard - {source_label}")
     record.setdefault("items", [])
+    record["items"] = normalize_dashboard_items(record.get("items", []))
+    record["filters"] = normalize_dashboard_filters(record.get("filters", []))
     record["layouts"] = normalize_layouts(record.get("items", []), record.get("layouts"))
     record["items"] = _sync_item_layouts(record.get("items", []), record["layouts"])
     return record
@@ -81,9 +87,190 @@ def save_dashboard(user_id: str, source_key: str, payload: dict[str, Any]) -> di
     data = dict(payload)
     data["dashboard_id"] = dashboard_id
     data["source_key"] = source_key
+    data["items"] = normalize_dashboard_items(data.get("items", []))
+    data["filters"] = normalize_dashboard_filters(data.get("filters", []))
     data["layouts"] = normalize_layouts(data.get("items", []), data.get("layouts"))
     data["items"] = _sync_item_layouts(data.get("items", []), data["layouts"])
     return save_dashboard_record(dashboard_id, data, user_id=user_id)
+
+
+def _clean_text(value: Any) -> str:
+    return re.sub(r"\s+", " ", str(value).strip()) if value is not None else ""
+
+
+def normalize_filter_behavior(filter_behavior: dict[str, Any] | None) -> dict[str, bool]:
+    return {
+        "ignore_global_filters": bool((filter_behavior or {}).get("ignore_global_filters", False)),
+    }
+
+
+def normalize_dashboard_items(items: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    normalized_items = []
+    for item in items or []:
+        item_copy = copy.deepcopy(item)
+        visual_type = str(item_copy.get("visual_type", "bar")).lower().strip()
+        item_copy["visual_type"] = visual_type if visual_type in DASHBOARD_VISUAL_TYPES else "bar"
+        item_copy["filter_behavior"] = normalize_filter_behavior(item_copy.get("filter_behavior"))
+        normalized_items.append(item_copy)
+    return normalized_items
+
+
+def normalize_dashboard_filters(filters: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    normalized_filters = []
+    seen_ids = set()
+    for raw_filter in filters or []:
+        column = _clean_text(raw_filter.get("column"))
+        if not column:
+            continue
+        filter_id = _clean_text(raw_filter.get("filter_id")) or uuid4().hex
+        if filter_id in seen_ids:
+            filter_id = uuid4().hex
+        seen_ids.add(filter_id)
+        selected_values = raw_filter.get("selected_values") or []
+        if not isinstance(selected_values, list):
+            selected_values = [selected_values]
+        normalized_filters.append(
+            {
+                "filter_id": filter_id,
+                "title": _clean_text(raw_filter.get("title")) or column,
+                "column": column,
+                "filter_type": "multiselect",
+                "selected_values": [_clean_text(value) for value in selected_values if _clean_text(value)],
+            }
+        )
+    return normalized_filters
+
+
+def build_dashboard_filter(title: str, column: str, filter_id: str | None = None) -> dict[str, Any]:
+    clean_column = _clean_text(column)
+    return {
+        "filter_id": filter_id or uuid4().hex,
+        "title": _clean_text(title) or clean_column,
+        "column": clean_column,
+        "filter_type": "multiselect",
+        "selected_values": [],
+    }
+
+
+def upsert_dashboard_filter(record: dict[str, Any], dashboard_filter: dict[str, Any]) -> dict[str, Any]:
+    new_record = copy.deepcopy(record)
+    filters = normalize_dashboard_filters(new_record.get("filters", []))
+    incoming = normalize_dashboard_filters([dashboard_filter])
+    if not incoming:
+        return new_record
+    incoming_filter = incoming[0]
+    replaced = False
+    for idx, existing in enumerate(filters):
+        if existing.get("filter_id") == incoming_filter["filter_id"]:
+            incoming_filter["selected_values"] = existing.get("selected_values", [])
+            filters[idx] = incoming_filter
+            replaced = True
+            break
+    if not replaced:
+        filters.append(incoming_filter)
+    new_record["filters"] = filters
+    return new_record
+
+
+def delete_dashboard_filter(record: dict[str, Any], filter_id: str) -> dict[str, Any]:
+    new_record = copy.deepcopy(record)
+    new_record["filters"] = [
+        item for item in normalize_dashboard_filters(new_record.get("filters", []))
+        if item.get("filter_id") != filter_id
+    ]
+    return new_record
+
+
+def update_dashboard_filter_values(record: dict[str, Any], filter_values: dict[str, list[Any]]) -> dict[str, Any]:
+    new_record = copy.deepcopy(record)
+    filters = normalize_dashboard_filters(new_record.get("filters", []))
+    for dashboard_filter in filters:
+        filter_id = dashboard_filter.get("filter_id")
+        if filter_id in filter_values:
+            values = filter_values.get(filter_id) or []
+            dashboard_filter["selected_values"] = [_clean_text(value) for value in values if _clean_text(value)]
+    new_record["filters"] = filters
+    return new_record
+
+
+def get_filter_value_options(
+    dashboard_filter: dict[str, Any],
+    db_mode: bool,
+    uri: str | None = None,
+    df_data: pd.DataFrame | None = None,
+    limit: int = 500,
+) -> list[str]:
+    column = dashboard_filter.get("column")
+    if not column:
+        return []
+
+    if db_mode:
+        if not uri:
+            return []
+        if "." not in column:
+            return []
+        table_name, column_name = column.split(".", 1)
+        query = f'SELECT DISTINCT CAST("{column_name}" AS TEXT) AS value FROM "{table_name}" WHERE "{column_name}" IS NOT NULL ORDER BY value LIMIT {int(limit)}'
+        try:
+            engine = create_engine(uri)
+            try:
+                result = pd.read_sql(text(query), engine)
+            finally:
+                engine.dispose()
+            return [_clean_text(value) for value in result["value"].dropna().tolist() if _clean_text(value)]
+        except Exception:
+            return []
+
+    if df_data is None or column not in df_data.columns:
+        return []
+    values = (
+        df_data[column]
+        .dropna()
+        .map(_clean_text)
+    )
+    values = values[values != ""].drop_duplicates().sort_values().head(limit)
+    return values.tolist()
+
+
+def apply_filters_to_dataframe(df_data: pd.DataFrame | None, filters: list[dict[str, Any]]) -> pd.DataFrame | None:
+    if df_data is None:
+        return None
+    filtered_df = df_data.copy()
+    for dashboard_filter in normalize_dashboard_filters(filters):
+        selected_values = dashboard_filter.get("selected_values") or []
+        column = dashboard_filter.get("column")
+        if not selected_values or column not in filtered_df.columns:
+            continue
+        allowed_values = {_clean_text(value) for value in selected_values}
+        filtered_df = filtered_df[filtered_df[column].map(_clean_text).isin(allowed_values)]
+    return filtered_df
+
+
+def has_active_dashboard_filters(filters: list[dict[str, Any]]) -> bool:
+    return any(item.get("selected_values") for item in normalize_dashboard_filters(filters))
+
+
+def _escape_sql_literal(value: Any) -> str:
+    return str(value).replace("'", "''")
+
+
+def apply_filters_to_sql_query(query_text: str, filters: list[dict[str, Any]]) -> str:
+    active_filters = [
+        item for item in normalize_dashboard_filters(filters)
+        if item.get("selected_values") and item.get("column")
+    ]
+    if not active_filters:
+        return query_text.replace(DASHBOARD_FILTER_MARKER, "")
+    if DASHBOARD_FILTER_MARKER not in query_text:
+        return query_text
+
+    clauses = []
+    for dashboard_filter in active_filters:
+        column = dashboard_filter["column"]
+        column_sql = ".".join([f'"{part}"' for part in column.split(".")]) if "." in column else f'"{column}"'
+        values_sql = ", ".join([f"'{_escape_sql_literal(value)}'" for value in dashboard_filter["selected_values"]])
+        clauses.append(f"AND CAST({column_sql} AS TEXT) IN ({values_sql})")
+    return query_text.replace(DASHBOARD_FILTER_MARKER, " ".join(clauses))
 
 
 def _default_layout_for_index(index: int) -> dict[str, int]:
@@ -175,11 +362,26 @@ def _sync_item_layouts(items: list[dict[str, Any]], layouts: dict[str, list[dict
     return synced_items
 
 
-def build_visual_system_prompt(db_mode: bool, profile: dict[str, Any] | None = None) -> str:
+def build_visual_system_prompt(
+    db_mode: bool,
+    profile: dict[str, Any] | None = None,
+    forced_visual_type: str | None = None,
+) -> str:
+    forced_visual_type = str(forced_visual_type or "").lower().strip()
+    forced_type_instruction = ""
+    if forced_visual_type in DASHBOARD_VISUAL_TYPES:
+        forced_type_instruction = (
+            f"15. O tipo de visual ja foi escolhido pelo usuario: {forced_visual_type}. "
+            "Retorne VisualType exatamente com esse valor e adapte apenas a query, dimensao, metrica, serie e titulo.\n"
+        )
+
     if db_mode:
         dialect_instructions = (
             "4. A consulta deve ser compatível com PostgreSQL.\n"
             "5. Para agregações por mês, use to_char em colunas de data.\n"
+            f"6. Para novos visuais, inclua {DASHBOARD_FILTER_MARKER} em um ponto valido da clausula WHERE para filtros globais. "
+            "Se nao houver filtro proprio, use WHERE 1=1 antes do marcador.\n"
+            "7. Evite aliases de tabela nos novos visuais para que filtros globais por tabela.coluna funcionem corretamente.\n"
         )
     else:
         dialect_instructions = (
@@ -206,7 +408,8 @@ def build_visual_system_prompt(db_mode: bool, profile: dict[str, Any] | None = N
         "11. Tipos aceitos: bar, line, area, pie, scatter, table, kpi.\n"
         "12. Dimension é a coluna categórica ou temporal principal.\n"
         "13. Metric é a medida principal.\n"
-        "14. Series é opcional e pode ficar vazio.\n\n"
+        "14. Series é opcional e pode ficar vazio.\n"
+        f"{forced_type_instruction}\n"
         "FORMATO:\n"
         "Query: <sql>\n"
         "VisualType: <tipo>\n"
@@ -226,15 +429,20 @@ def generate_visual_instructions(
     db_mode: bool,
     profile: dict[str, Any] | None = None,
     df_preview: pd.DataFrame | None = None,
+    forced_visual_type: str | None = None,
 ) -> str:
     preview_text = ""
     if df_preview is not None and not df_preview.empty:
         preview_text = df_preview.head(5).to_markdown(index=False)
     messages = [
-        {"role": "system", "content": build_visual_system_prompt(db_mode, profile)},
+        {"role": "system", "content": build_visual_system_prompt(db_mode, profile, forced_visual_type)},
         {
             "role": "user",
-            "content": f"Esquema:\n{schema_text}\n\nPreview:\n{preview_text}\n\nPedido:\n{question}",
+            "content": (
+                f"Esquema:\n{schema_text}\n\nPreview:\n{preview_text}\n\n"
+                f"Tipo escolhido pelo usuario: {forced_visual_type or '(nao informado)'}\n\n"
+                f"Pedido:\n{question}"
+            ),
         },
     ]
     response = client.chat.completions.create(
@@ -532,6 +740,7 @@ def build_dashboard_item(
     chart_id: str | None = None,
     title_override: str = "",
     layout: dict[str, Any] | None = None,
+    filter_behavior: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     title = title_override.strip() if title_override else str(visual_spec.get("title") or "Novo visual")
     item = {
@@ -546,6 +755,7 @@ def build_dashboard_item(
             "series": visual_spec.get("series", ""),
         },
         "echarts_spec": _json_safe(echarts_spec),
+        "filter_behavior": normalize_filter_behavior(filter_behavior),
         "layout": layout or {},
     }
     return item
@@ -587,6 +797,7 @@ def duplicate_dashboard_item(record: dict[str, Any], chart_id: str) -> dict[str,
     duplicated = copy.deepcopy(source_item)
     duplicated["chart_id"] = uuid4().hex
     duplicated["title"] = f"{source_item.get('title', 'Visual')} (cópia)"
+    duplicated["filter_behavior"] = normalize_filter_behavior(duplicated.get("filter_behavior"))
     layout = dict(source_item.get("layout") or {})
     layout["x"] = int(layout.get("x", 0)) + 1
     layout["y"] = int(layout.get("y", 0)) + 1
@@ -612,9 +823,12 @@ def build_render_items(
     db_mode: bool,
     uri: str | None = None,
     df_data: pd.DataFrame | None = None,
+    active_filters: list[dict[str, Any]] | None = None,
 ) -> list[dict[str, Any]]:
     items_to_render = []
-    for item in dashboard_record.get("items", []):
+    active_filters = normalize_dashboard_filters(active_filters if active_filters is not None else dashboard_record.get("filters", []))
+    active_filter_selected = has_active_dashboard_filters(active_filters)
+    for item in normalize_dashboard_items(dashboard_record.get("items", [])):
         payload = {
             "chart_id": item.get("chart_id"),
             "title": item.get("title", "Visual"),
@@ -622,11 +836,17 @@ def build_render_items(
             "prompt": item.get("prompt", ""),
         }
         try:
+            filter_behavior = normalize_filter_behavior(item.get("filter_behavior"))
+            item_filters = [] if filter_behavior.get("ignore_global_filters") else active_filters
+            query_text = item.get("query_text", "")
             stored_spec = item.get("echarts_spec")
-            if isinstance(stored_spec, dict) and stored_spec.get("render_mode"):
-                payload["render_spec"] = _json_safe(stored_spec)
-            else:
-                df_result = run_visual_query(item.get("query_text", ""), db_mode=db_mode, uri=uri, df_data=df_data)
+            if query_text:
+                if db_mode:
+                    query_text = apply_filters_to_sql_query(query_text, item_filters)
+                    df_result = run_visual_query(query_text, db_mode=True, uri=uri, df_data=None)
+                else:
+                    filtered_df_data = apply_filters_to_dataframe(df_data, item_filters)
+                    df_result = run_visual_query(query_text, db_mode=False, df_data=filtered_df_data)
                 spec = build_echarts_spec(
                     df_result,
                     {
@@ -638,6 +858,13 @@ def build_render_items(
                     },
                 )
                 payload["render_spec"] = _json_safe(spec)
+            elif isinstance(stored_spec, dict) and stored_spec.get("render_mode") and not active_filter_selected:
+                payload["render_spec"] = _json_safe(stored_spec)
+            else:
+                payload["render_spec"] = {
+                    "render_mode": "error",
+                    "message": "Visual sem query para recalcular com filtros.",
+                }
             payload["status"] = "ready"
         except Exception as exc:
             payload["render_spec"] = {

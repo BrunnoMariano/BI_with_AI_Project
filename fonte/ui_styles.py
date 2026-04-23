@@ -61,7 +61,20 @@ footer {visibility: hidden;}
 #MainMenu {visibility: hidden;}
 [data-testid="stDecoration"] {display: none !important;}
 [data-testid="stToolbarActions"] {display: none !important;}
-.stAppToolbar {display: none !important;}
+.stAppToolbar {
+    visibility: visible !important;
+    pointer-events: auto !important;
+}
+
+[data-testid="collapsedControl"],
+[data-testid="stSidebarCollapsedControl"],
+[data-testid="stSidebarCollapseButton"] {
+    display: flex !important;
+    visibility: visible !important;
+    opacity: 1 !important;
+    pointer-events: auto !important;
+    z-index: 999999 !important;
+}
 
 [data-testid="stAppViewContainer"] > .main {
     background: transparent;

@@ -11,3 +11,9 @@ streamlit-option-menu
 tabulate
 cryptography
 requests
+scikit-learn
+statsmodels
+lightgbm
+joblib
+holidays
+pytest

@@ -100,7 +100,7 @@ data/               # planilha (fora do Git)
 
 Marque `[x]` ao concluir cada fase.
 
-- [ ] **Fase 0** — Preparação: `fonte/ml/`, `tests/`, `notebooks/`, `data/`; adicionar `data/`, `*.xlsx` e `*.joblib` ao `.gitignore`; dependências no `requirements.txt`.
+- [x] **Fase 0** — Preparação: `fonte/ml/`, `tests/`, `notebooks/`, `data/`; adicionar `data/`, `*.xlsx` e `*.joblib` ao `.gitignore`; dependências no `requirements.txt`.
 - [ ] **Fase 1** — Esquema e limpeza (`schema.py`, `preprocessing.py`), perfil do dataset usando `detect_schema`.
 - [ ] **Fase 2** — Previsão de vendas (`features.py`, `forecasting.py`, `metrics.py`, `registry.py`, `pipeline.py`) com backtest e intervalos de 80%/95%.
 - [ ] **Fase 3** — Aba "Previsões" em `appLAB.py`: KPIs de 28 dias, gráfico real + previsto + faixa, seletores, tabela de modelos, modo simulação (data de corte escolhida → previsto × real), botão Retreinar, download CSV.

@@ -31,11 +31,16 @@ from login_interface import show_login_page, show_logout_button
 from db_utils import introspect_schema
 from openai import OpenAI
 import pandasql as ps
+from firebase_service import FirebaseError
 from user_data import (
     append_chat_message,
     clear_chat_history,
+    default_openai_key_enabled,
+    delete_default_openai_key,
+    get_default_openai_key,
     load_dataframe_from_storage,
     save_db_config,
+    save_default_openai_key,
     save_uploaded_file,
 )
 from ui_styles import inject_global_styles, render_app_hero, render_section_intro
@@ -853,10 +858,59 @@ else:
                 "<p class='ui-section-label'>Assistente</p><h3 style='margin-top:0;'>Configurações da IA</h3>",
                 unsafe_allow_html=True,
             )
-            nova_chave = st.text_input("Chave OpenAI", type="password", value=openai_api_key)
-            st.session_state['openai_api_key'] = nova_chave
-            openai_api_key = nova_chave
-            
+            try:
+                chave_padrao = get_default_openai_key()
+            except FirebaseError as e:
+                chave_padrao = None
+                st.warning(f"Não foi possível carregar a chave padrão: {e}")
+
+            usar_chave_padrao = False
+            if chave_padrao:
+                usar_chave_padrao = st.checkbox(
+                    "Usar chave API padrão",
+                    value=st.session_state.get('usar_chave_padrao', True),
+                    help="Usa a chave OpenAI salva (criptografada) na sua conta.",
+                )
+                st.session_state['usar_chave_padrao'] = usar_chave_padrao
+
+            if usar_chave_padrao:
+                st.caption(f"Usando a chave padrão da conta (termina em ...{chave_padrao[-4:]}).")
+                openai_api_key = chave_padrao
+            else:
+                nova_chave = st.text_input(
+                    "Chave OpenAI",
+                    type="password",
+                    value=st.session_state.get('openai_api_key_manual', ''),
+                )
+                st.session_state['openai_api_key_manual'] = nova_chave
+                openai_api_key = nova_chave
+            st.session_state['openai_api_key'] = openai_api_key
+
+            with st.expander("Chave padrão da conta"):
+                if not default_openai_key_enabled():
+                    st.info("Para salvar uma chave padrão, adicione `[app] encryption_key` ao `.streamlit/secrets.toml`.")
+                else:
+                    with st.form("form_chave_padrao", clear_on_submit=True):
+                        chave_para_salvar = st.text_input("Nova chave padrão", type="password")
+                        if st.form_submit_button("Salvar como padrão"):
+                            if not chave_para_salvar.strip():
+                                st.warning("Digite a chave antes de salvar.")
+                            else:
+                                with st.spinner("Validando chave na OpenAI..."):
+                                    try:
+                                        OpenAI(api_key=chave_para_salvar.strip()).models.list()
+                                    except Exception:
+                                        st.error("A OpenAI recusou essa chave. Confira e tente de novo.")
+                                    else:
+                                        save_default_openai_key(chave_para_salvar)
+                                        st.session_state['usar_chave_padrao'] = True
+                                        st.toast("Chave padrão salva na sua conta.")
+                                        st.rerun()
+                    if chave_padrao and st.button("Remover chave padrão"):
+                        delete_default_openai_key()
+                        st.session_state['usar_chave_padrao'] = False
+                        st.rerun()
+
             # Tentar achar o índice correto do selectbox
             default_ix = 0
             for i, val in enumerate(model_options.values()):

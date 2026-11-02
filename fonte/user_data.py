@@ -3,6 +3,7 @@ import io
 from uuid import uuid4
 import streamlit as st
 import pandas as pd
+from cryptography.fernet import Fernet, InvalidToken
 
 from firebase_service import (
     FirebaseError,
@@ -96,6 +97,81 @@ def save_db_config(user_id: str, credentials_dict: dict):
         _get_id_token(),
     )
     return True
+
+
+# --- Chave OpenAI padrao (criptografada no Firestore) ---
+
+def encrypt_secret(value: str, encryption_key: str) -> str:
+    """Criptografa um texto com Fernet usando a chave de criptografia do app."""
+    return Fernet(encryption_key.encode()).encrypt(value.encode()).decode()
+
+
+def decrypt_secret(token: str, encryption_key: str) -> str | None:
+    """Descriptografa um texto gerado por `encrypt_secret`; retorna None se a chave nao confere."""
+    try:
+        return Fernet(encryption_key.encode()).decrypt(token.encode()).decode()
+    except (InvalidToken, ValueError):
+        return None
+
+
+def _get_encryption_key() -> str | None:
+    """Le `[app] encryption_key` do secrets.toml (nunca do codigo)."""
+    try:
+        return st.secrets.get("app", {}).get("encryption_key") or None
+    except FileNotFoundError:
+        return None
+
+
+def default_openai_key_enabled() -> bool:
+    """Indica se o app tem chave de criptografia para guardar a chave OpenAI padrao."""
+    return _get_encryption_key() is not None
+
+
+def _openai_config_path(user_id: str) -> str:
+    return f"users/{user_id}/settings/openai_config"
+
+
+def get_default_openai_key() -> str | None:
+    """Busca (uma vez por sessao) a chave OpenAI padrao salva na conta do usuario."""
+    user = _get_active_user()
+    cache = st.session_state.get("default_openai_key_cache")
+    if cache and cache["user_id"] == user["user_id"]:
+        return cache["api_key"]
+
+    api_key = None
+    encryption_key = _get_encryption_key()
+    if encryption_key:
+        document = get_document(_openai_config_path(user["user_id"]), user["idToken"])
+        if document and document.get("api_key_encrypted"):
+            api_key = decrypt_secret(document["api_key_encrypted"], encryption_key)
+
+    st.session_state["default_openai_key_cache"] = {"user_id": user["user_id"], "api_key": api_key}
+    return api_key
+
+
+def save_default_openai_key(api_key: str) -> None:
+    """Salva a chave OpenAI padrao do usuario criptografada no Firestore."""
+    user = _get_active_user()
+    encryption_key = _get_encryption_key()
+    if not encryption_key:
+        raise RuntimeError("Chave de criptografia `[app] encryption_key` ausente em `.streamlit/secrets.toml`.")
+    api_key = api_key.strip()
+    set_document(
+        _openai_config_path(user["user_id"]),
+        {
+            "api_key_encrypted": encrypt_secret(api_key, encryption_key),
+            "updated_at": build_message_record("system", "openai_config")["created_at"],
+        },
+        user["idToken"],
+    )
+    st.session_state["default_openai_key_cache"] = {"user_id": user["user_id"], "api_key": api_key}
+
+
+def delete_default_openai_key() -> None:
+    """Remove a chave OpenAI padrao da conta do usuario."""
+    user = _get_active_user()
+    delete_document(_openai_config_path(user["user_id"]), user["idToken"])
+    st.session_state["default_openai_key_cache"] = {"user_id": user["user_id"], "api_key": None}
 
 
 def fetch_chat_history(user_id: str | None = None) -> list[dict]:

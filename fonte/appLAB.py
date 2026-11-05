@@ -44,6 +44,7 @@ from user_data import (
     save_uploaded_file,
 )
 from ui_styles import inject_global_styles, render_app_hero, render_section_intro
+from ml.schema import SPECIALIZED_FILE_REQUIRED_COLUMNS, detect_dataset_profile
 
 st.set_page_config(page_title="Plataforma de Dados", page_icon="⚙️", layout="wide")
 inject_global_styles()
@@ -88,20 +89,6 @@ def describe_dataframe_schema(df: pd.DataFrame) -> str:
     return "\n".join(lines)
 
 
-SPECIALIZED_FILE_REQUIRED_COLUMNS = {
-    "produto",
-    "valor pago",
-    "status venda",
-    "forma de pagamento",
-    "data venda",
-    "criado em",
-}
-
-
-def _normalize_label(value) -> str:
-    return re.sub(r"\s+", " ", str(value).strip().lower())
-
-
 def _series_examples(series: pd.Series, limit: int = 3) -> str:
     examples = []
     seen = set()
@@ -141,13 +128,6 @@ def _count_case_variants(series: pd.Series) -> int:
 
 def build_schema_dict_from_dataframe(df: pd.DataFrame) -> dict:
     return {"df": [(column, str(df[column].dtype)) for column in df.columns]}
-
-
-def detect_dataset_profile(df: pd.DataFrame, file_name: str = "") -> str:
-    normalized_columns = {_normalize_label(column) for column in df.columns}
-    if SPECIALIZED_FILE_REQUIRED_COLUMNS.issubset(normalized_columns):
-        return "client_sales_profile_v1"
-    return "generic_file_v1"
 
 
 def build_dataset_profile(df: pd.DataFrame, file_name: str = "") -> dict:

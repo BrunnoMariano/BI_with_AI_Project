@@ -45,6 +45,7 @@ from user_data import (
 )
 from ui_styles import inject_global_styles, render_app_hero, render_section_intro
 from ml.schema import SPECIALIZED_FILE_REQUIRED_COLUMNS, detect_dataset_profile
+from forecast_tab import render_forecast_tab
 
 st.set_page_config(page_title="Plataforma de Dados", page_icon="⚙️", layout="wide")
 inject_global_styles()
@@ -967,7 +968,7 @@ else:
                             st.session_state["selected_file_id"] = saved_file["file_id"]
                             st.success("Arquivo enviado e vinculado a sua conta.")
                             st.rerun()
-    tab1, tab2, tab3 = st.tabs(["Conversa", "Dashboard", "Histórico"])
+    tab1, tab2, tab3, tab4 = st.tabs(["Conversa", "Dashboard", "Histórico", "Previsões"])
 
     with tab1:
         render_section_intro(
@@ -1500,3 +1501,6 @@ else:
             if st.button("Limpar Histórico"):
                 clear_chat_history()
                 st.rerun()
+
+    with tab4:
+        render_forecast_tab(fonte_dados)

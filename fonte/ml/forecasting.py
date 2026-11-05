@@ -19,7 +19,7 @@ import numpy as np
 import pandas as pd
 
 from ml import metrics
-from ml.features import calendar_features
+from ml.features import agregar_serie, calendar_features, dias_no_periodo, periodos
 
 HORIZONTE_PADRAO = 28
 N_CORTES_PADRAO = 4
@@ -332,3 +332,201 @@ def fit_best(
         raise ValueError("Nenhum modelo conseguiu completar o backtest.")
     vencedor = str(tabela.dropna(subset=["wape"]).iloc[0]["modelo"])
     return AjustePrevisao(serie=serie, modelo=vencedor, tabela=tabela, backtest=resultado)
+
+
+# ---------- agregação (semana/mês/total) com intervalos ----------
+
+N_SIMULACOES = 2000
+BLOCO_SIMULACAO = 7
+
+
+def matriz_residuos(residuos) -> np.ndarray:
+    """Resíduos do backtest como matriz (cortes x passos), sem cortes que falharam.
+
+    Aceita a matriz direto ou o DataFrame longo (corte, passo, residuo) salvo pelo pipeline.
+    """
+    if isinstance(residuos, pd.DataFrame):
+        residuos = residuos.pivot(index="corte", columns="passo", values="residuo").sort_index().to_numpy()
+    matriz = np.atleast_2d(np.asarray(residuos, dtype=float))
+    return matriz[np.isfinite(matriz).all(axis=1)]
+
+
+def residuos_longos(matriz) -> pd.DataFrame:
+    """Matriz (cortes x passos) -> DataFrame corte, passo, residuo (formato aceito pelo Firestore)."""
+    matriz = np.atleast_2d(np.asarray(matriz, dtype=float))
+    cortes, passos = np.indices(matriz.shape)
+    return pd.DataFrame({"corte": cortes.ravel() + 1, "passo": passos.ravel() + 1, "residuo": matriz.ravel()})
+
+
+def simular_trajetorias(
+    previsto, residuos, n_sim: int = N_SIMULACOES, bloco: int = BLOCO_SIMULACAO, seed: int = 42
+) -> np.ndarray:
+    """Trajetórias possíveis (n_sim x h) = previsto + erros reais do backtest, cortadas em zero.
+
+    Block bootstrap: cada trajetória sorteia UM corte do backtest e, dentro dele, blocos
+    de 7 dias seguidos. Assim mantém o padrão da semana e o viés de nível de cada corte,
+    o que dá faixas realistas para totais (somar as faixas diárias exageraria a incerteza).
+    """
+    previsto = np.asarray(previsto, dtype=float)
+    matriz = matriz_residuos(residuos)
+    if matriz.size == 0:
+        raise ValueError("Sem resíduos de backtest para simular.")
+    rng = np.random.default_rng(seed)
+    n_cortes, passos = matriz.shape
+    bloco = min(bloco, passos)
+    n_blocos = int(np.ceil(len(previsto) / bloco))
+    cortes = rng.integers(0, n_cortes, size=n_sim)
+    inicios = rng.integers(0, passos - bloco + 1, size=(n_sim, n_blocos))
+    colunas = (inicios[:, :, None] + np.arange(bloco)).reshape(n_sim, -1)[:, : len(previsto)]
+    erros = matriz[cortes[:, None], colunas]
+    return np.maximum(previsto + erros, 0.0)
+
+
+def _limites_das_somas(somas: np.ndarray) -> dict[str, np.ndarray]:
+    limites = {}
+    for nivel, (q_inf, q_sup) in QUANTIS_INTERVALO.items():
+        limites[f"lim_inf_{nivel}"] = np.quantile(somas, q_inf, axis=0)
+        limites[f"lim_sup_{nivel}"] = np.quantile(somas, q_sup, axis=0)
+    return limites
+
+
+def total_com_intervalo(previsao: pd.DataFrame, residuos, dias: int | None = None) -> dict:
+    """Total previsto dos primeiros `dias` dias com faixas de 80%/95% (via simular_trajetorias)."""
+    parte = previsao if dias is None else previsao.iloc[:dias]
+    total = {"previsto": float(parte["previsto"].sum()), "dias": int(len(parte))}
+    try:
+        somas = simular_trajetorias(parte["previsto"].to_numpy(), residuos).sum(axis=1)
+        total.update({chave: float(valor) for chave, valor in _limites_das_somas(somas).items()})
+    except ValueError:
+        total.update({f"lim_{lado}_{nivel}": float("nan") for nivel in QUANTIS_INTERVALO for lado in ("inf", "sup")})
+    return total
+
+
+def agregar_previsao(
+    previsao: pd.DataFrame, residuos, granularidade: str = "dia", historico: pd.Series | None = None
+) -> pd.DataFrame:
+    """Previsão somada por dia/semana/mês com faixas de 80%/95%.
+
+    - "dia": devolve as faixas diárias da própria previsão;
+    - "semana"/"mes": faixas pelos quantis das somas das trajetórias simuladas;
+    - no mês em que a previsão começa, soma o que já foi realizado (`historico`) para
+      que o mês apareça inteiro (realizado + previsto).
+    Colunas: periodo, previsto, lim_inf_80, lim_sup_80, lim_inf_95, lim_sup_95, n_dias, realizado, parcial.
+    """
+    origem = previsao["data"].iloc[0]
+    chaves = periodos(previsao["data"], granularidade, origem)
+    rotulos, posicoes = np.unique(chaves, return_inverse=True)
+    rotulos = pd.DatetimeIndex(rotulos)
+
+    if granularidade == "dia":
+        resultado = previsao.rename(columns={"data": "periodo"}).reset_index(drop=True)
+    else:
+        trajetorias = simular_trajetorias(previsao["previsto"].to_numpy(), residuos)
+        somas = np.zeros((trajetorias.shape[0], len(rotulos)))
+        for i in range(len(rotulos)):
+            somas[:, i] = trajetorias[:, posicoes == i].sum(axis=1)
+        resultado = pd.DataFrame(
+            {
+                "periodo": rotulos,
+                "previsto": np.bincount(posicoes, weights=previsao["previsto"].to_numpy(), minlength=len(rotulos)),
+                **_limites_das_somas(somas),
+            }
+        )
+    resultado["n_dias"] = np.bincount(posicoes, minlength=len(rotulos))
+    resultado["realizado"] = 0.0
+
+    if granularidade == "mes" and historico is not None and len(historico):
+        ja_realizado = historico[periodos(historico.index, "mes") == rotulos[0]]
+        if len(ja_realizado):
+            colunas_valor = ["previsto", "lim_inf_80", "lim_sup_80", "lim_inf_95", "lim_sup_95"]
+            resultado.loc[0, colunas_valor] += float(ja_realizado.sum())
+            resultado.loc[0, "realizado"] = float(ja_realizado.sum())
+            resultado.loc[0, "n_dias"] += len(ja_realizado)
+
+    resultado["parcial"] = resultado["n_dias"].to_numpy() < dias_no_periodo(resultado["periodo"], granularidade)
+    colunas = ["periodo", "previsto", "lim_inf_80", "lim_sup_80", "lim_inf_95", "lim_sup_95", "n_dias", "realizado", "parcial"]
+    return resultado[colunas]
+
+
+def agregar_historico(historico: pd.Series, granularidade: str = "dia", origem=None) -> pd.DataFrame:
+    """Histórico somado por período, alinhado à previsão.
+
+    O primeiro período, se incompleto (a série começa no meio da semana/mês), sai para
+    não parecer uma queda de vendas. No modo "mes", o mês em que a previsão começa
+    também sai (ele aparece na previsão como realizado + previsto).
+    """
+    resultado = agregar_serie(historico, granularidade, origem)
+    if granularidade != "dia" and len(resultado) > 1 and resultado["parcial"].iloc[0]:
+        resultado = resultado.iloc[1:].reset_index(drop=True)
+    if granularidade == "mes" and origem is not None:
+        mes_origem = periodos([origem], "mes")[0]
+        resultado = resultado[resultado["periodo"] != mes_origem].reset_index(drop=True)
+    return resultado
+
+
+# ---------- modo simulação ----------
+
+MODELOS_RESERVA = ("holt_winters", "baseline_sazonal_7d")
+
+
+def simulate(serie: pd.Series, corte, modelo: str, horizonte: int = HORIZONTE_PADRAO) -> dict:
+    """Simula a previsão feita no passado: treina só com dados até `corte` (inclusive)
+    e compara com o real dos `horizonte` dias seguintes.
+
+    As faixas vêm de um backtest (mesma função da Fase 2) rodado só com os dados até o corte.
+    Se o modelo pedido não rodar com o treino curto, usa Holt-Winters ou o baseline.
+    """
+    corte = pd.Timestamp(corte).normalize()
+    treino = serie.loc[:corte]
+    teste = serie.loc[corte + pd.Timedelta(days=1) : corte + pd.Timedelta(days=horizonte)]
+    if len(teste) < horizonte:
+        raise ValueError(f"Depois do corte é preciso ter {horizonte} dias de dados reais; há {len(teste)}.")
+    if len(treino) < MIN_DIAS_TREINO:
+        raise ValueError(f"O treino até o corte tem {len(treino)} dias; o mínimo é {MIN_DIAS_TREINO}.")
+
+    avisos, usado, previsto = [], None, None
+    for candidato in dict.fromkeys([modelo, *MODELOS_RESERVA]):
+        try:
+            previsto = prever(candidato, treino, horizonte)
+            usado = candidato
+            break
+        except Exception as erro:
+            avisos.append(f"{candidato} não rodou com o treino até o corte ({erro}).")
+    if usado is None:
+        raise ValueError("Nenhum modelo conseguiu prever a partir dessa data de corte.")
+
+    n_cortes = min(N_CORTES_PADRAO, (len(treino) - MIN_DIAS_TREINO) // horizonte)
+    residuos = None
+    if n_cortes >= 1:
+        with warnings.catch_warnings():
+            warnings.simplefilter("ignore")
+            residuos = backtest(treino, horizonte, n_cortes, modelos=[usado])["residuos"][usado]
+        if matriz_residuos(residuos).size == 0:
+            residuos = None
+    if residuos is None:
+        n_cortes = 0
+        avisos.append(
+            "Faixas indisponíveis: o treino até o corte é curto demais para medir o erro "
+            f"(precisa de {MIN_DIAS_TREINO + horizonte} dias)."
+        )
+
+    real = teste.to_numpy(dtype=float)
+    limites = intervalos(previsto, residuos if residuos is not None else [])
+    previsao = pd.DataFrame({"data": teste.index, "real": real, "previsto": previsto, **limites})
+    return {
+        "previsao": previsao,
+        "corte": corte,
+        "modelo": usado,
+        "modelo_pedido": modelo,
+        "n_dias_treino": int(len(treino)),
+        "n_cortes_intervalo": int(n_cortes),
+        "wape": metrics.wape(real, previsto),
+        "mae": metrics.mae(real, previsto),
+        "erro_total": metrics.erro_total(real, previsto),
+        "total_real": float(real.sum()),
+        "total_previsto": float(previsto.sum()),
+        "cobertura_80": (
+            metrics.cobertura(real, limites["lim_inf_80"], limites["lim_sup_80"]) if residuos is not None else float("nan")
+        ),
+        "avisos": avisos,
+    }

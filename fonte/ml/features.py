@@ -82,6 +82,84 @@ def build_daily_series(
     return serie
 
 
+GRANULARIDADES = ("dia", "semana", "mes")
+DIAS_POR_MES = 30.4375
+
+
+def periodos(datas, granularidade: str = "dia", origem=None) -> pd.DatetimeIndex:
+    """Data de início do período de cada dia.
+
+    - "dia": o próprio dia;
+    - "semana": blocos de 7 dias alinhados à `origem` (início da previsão), para que
+      nenhuma semana misture dias reais e previstos;
+    - "mes": primeiro dia do mês do calendário.
+    """
+    indice = pd.DatetimeIndex(datas).normalize()
+    if granularidade == "dia":
+        return indice
+    if granularidade == "semana":
+        origem = indice.min() if origem is None else pd.Timestamp(origem).normalize()
+        deslocamento = np.floor((indice - origem).days / 7).astype(int) * 7
+        return pd.DatetimeIndex(origem + pd.to_timedelta(deslocamento, unit="D"))
+    if granularidade == "mes":
+        return indice.to_period("M").to_timestamp()
+    raise ValueError(f"granularidade deve ser uma de {GRANULARIDADES}, recebido: {granularidade!r}")
+
+
+def dias_no_periodo(inicio_periodo, granularidade: str) -> np.ndarray:
+    """Quantos dias tem um período completo (1, 7 ou os dias do mês)."""
+    inicio_periodo = pd.DatetimeIndex(inicio_periodo)
+    if granularidade == "dia":
+        return np.ones(len(inicio_periodo), dtype=int)
+    if granularidade == "semana":
+        return np.full(len(inicio_periodo), 7, dtype=int)
+    return np.asarray(inicio_periodo.days_in_month, dtype=int)
+
+
+def agregar_serie(serie: pd.Series, granularidade: str = "dia", origem=None) -> pd.DataFrame:
+    """Soma a série diária por período. Devolve periodo, real, n_dias e parcial (período incompleto)."""
+    chaves = periodos(serie.index, granularidade, origem)
+    agrupado = pd.DataFrame({"periodo": chaves, "real": np.asarray(serie, dtype=float)}).groupby("periodo")
+    resultado = agrupado.agg(real=("real", "sum"), n_dias=("real", "size")).reset_index()
+    resultado["parcial"] = resultado["n_dias"] < dias_no_periodo(resultado["periodo"], granularidade)
+    return resultado
+
+
+def summarize_b2b(df_clean: pd.DataFrame, inicio, fim) -> dict:
+    """Resumo descritivo das vendas corporativas (B2B) pagas: histórico completo e janela de treino.
+
+    B2B não entra na previsão (decisão 3 do CLAUDE.md); este resumo só descreve o passado.
+    """
+    inicio, fim = pd.Timestamp(inicio).normalize(), pd.Timestamp(fim).normalize()
+    pagos = df_clean.loc[df_clean["pago"].astype(bool) & df_clean["data_pedido"].notna()]
+    b2b = pagos.loc[pagos["is_b2b"].astype(bool)]
+    dias = b2b["data_pedido"].dt.normalize()
+    janela = b2b.loc[(dias >= inicio) & (dias <= fim)]
+
+    dias_pagos = pagos["data_pedido"].dt.normalize()
+    receita_total_janela = float(pagos.loc[(dias_pagos >= inicio) & (dias_pagos <= fim), "valor"].sum())
+    meses = ((fim - inicio).days + 1) / DIAS_POR_MES
+    return {
+        "historico": {
+            "pedidos": int(len(b2b)),
+            "receita": float(b2b["valor"].sum()),
+            "inicio": dias.min().date().isoformat() if len(b2b) else None,
+            "fim": dias.max().date().isoformat() if len(b2b) else None,
+        },
+        "janela": {
+            "pedidos": int(len(janela)),
+            "receita": float(janela["valor"].sum()),
+            "inicio": inicio.date().isoformat(),
+            "fim": fim.date().isoformat(),
+            "meses": float(meses),
+            "media_mensal_pedidos": float(len(janela) / meses),
+            "media_mensal_receita": float(janela["valor"].sum() / meses),
+            "ticket_medio": float(janela["valor"].mean()) if len(janela) else 0.0,
+            "participacao_receita": float(janela["valor"].sum() / receita_total_janela) if receita_total_janela else 0.0,
+        },
+    }
+
+
 def calendar_features(datas) -> pd.DataFrame:
     """Variáveis de calendário por dia: dia da semana, dia do mês, fim de semana e feriado nacional."""
     indice = pd.DatetimeIndex(datas)

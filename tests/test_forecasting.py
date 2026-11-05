@@ -353,6 +353,158 @@ def test_pipeline_base_sem_colunas_da_erro():
         run_predictive_pipeline(pd.DataFrame({"a": [1]}), "x")
 
 
+# ---------- Fase 3: agregação, totais, simulação e B2B ----------
+
+from ml.features import agregar_serie, periodos, summarize_b2b  # noqa: E402
+from ml.forecasting import (  # noqa: E402
+    agregar_historico,
+    agregar_previsao,
+    matriz_residuos,
+    residuos_longos,
+    simular_trajetorias,
+    simulate,
+    total_com_intervalo,
+)
+from ml.pipeline import verificar_requisitos  # noqa: E402
+
+
+def test_periodos_semana_alinhada_a_origem_e_mes():
+    datas = pd.date_range("2026-03-30", "2026-04-14")
+    semanas = periodos(datas, "semana", origem="2026-04-07")
+    assert semanas[datas.get_loc("2026-04-06")] == pd.Timestamp("2026-03-31")  # semana antes da origem
+    assert semanas[datas.get_loc("2026-04-07")] == pd.Timestamp("2026-04-07")
+    assert semanas[datas.get_loc("2026-04-13")] == pd.Timestamp("2026-04-07")
+    assert periodos(["2026-04-15"], "mes")[0] == pd.Timestamp("2026-04-01")
+    with pytest.raises(ValueError):
+        periodos(datas, "ano")
+
+
+def test_agregar_serie_marca_periodo_incompleto():
+    serie = pd.Series(1.0, index=pd.date_range("2026-03-01", "2026-04-06"))
+    mensal = agregar_serie(serie, "mes")
+    assert mensal["real"].tolist() == [31.0, 6.0]
+    assert mensal["parcial"].tolist() == [False, True]
+
+
+def test_residuos_longos_ida_e_volta():
+    matriz = np.arange(8.0).reshape(2, 4)
+    longo = residuos_longos(matriz)
+    assert list(longo.columns) == ["corte", "passo", "residuo"]
+    np.testing.assert_array_equal(matriz_residuos(longo), matriz)
+    com_falha = np.vstack([matriz, np.full(4, np.nan)])
+    assert matriz_residuos(com_falha).shape == (2, 4)
+
+
+def test_simular_trajetorias_formato_e_sem_negativos():
+    residuos = np.tile(np.array([-30.0, 5.0, 10.0, -2.0, 3.0, 1.0, 0.0]), (2, 4))
+    trajetorias = simular_trajetorias(np.full(40, 10.0), residuos, n_sim=500)
+    assert trajetorias.shape == (500, 40)
+    assert (trajetorias >= 0).all()
+    with pytest.raises(ValueError):
+        simular_trajetorias(np.ones(5), np.full((2, 28), np.nan))
+
+
+def test_total_com_intervalo_mais_estreito_que_soma_das_faixas_diarias():
+    serie = _serie_semanal(200, ruido=2.0)
+    ajuste = fit_best(serie)
+    previsao = ajuste.forecast(28)
+    total = total_com_intervalo(previsao, ajuste.residuos)
+    assert total["previsto"] == pytest.approx(previsao["previsto"].sum())
+    assert total["lim_inf_95"] <= total["lim_inf_80"] <= total["previsto"] <= total["lim_sup_80"] <= total["lim_sup_95"]
+    soma_faixas = previsao["lim_sup_80"].sum() - previsao["lim_inf_80"].sum()
+    assert total["lim_sup_80"] - total["lim_inf_80"] < soma_faixas
+    vazio = total_com_intervalo(previsao, np.full((1, 28), np.nan))
+    assert np.isnan(vazio["lim_inf_80"])
+
+
+def test_agregar_previsao_semana_e_mes_com_realizado():
+    serie = _serie_semanal(200, ruido=1.0)
+    ajuste = fit_best(serie, modelos=["baseline_sazonal_7d", "holt_winters"])
+    previsao = ajuste.forecast(40)
+
+    diaria = agregar_previsao(previsao, ajuste.residuos, "dia")
+    assert len(diaria) == 40 and diaria["n_dias"].eq(1).all()
+
+    semanal = agregar_previsao(previsao, ajuste.residuos, "semana")
+    assert semanal["periodo"].iloc[0] == previsao["data"].iloc[0]
+    assert semanal["n_dias"].tolist() == [7, 7, 7, 7, 7, 5]
+    assert semanal["parcial"].tolist() == [False] * 5 + [True]
+    assert semanal["previsto"].sum() == pytest.approx(previsao["previsto"].sum())
+    assert (semanal["lim_inf_80"] <= semanal["lim_sup_80"]).all()
+
+    mensal = agregar_previsao(previsao, ajuste.residuos, "mes", historico=serie)
+    primeiro_mes = periodos([previsao["data"].iloc[0]], "mes")[0]
+    ja_realizado = serie[periodos(serie.index, "mes") == primeiro_mes].sum()
+    assert mensal.loc[0, "realizado"] == pytest.approx(ja_realizado)
+    assert mensal["previsto"].sum() == pytest.approx(previsao["previsto"].sum() + ja_realizado)
+
+    historico_mensal = agregar_historico(serie, "mes", previsao["data"].iloc[0])
+    assert primeiro_mes not in set(historico_mensal["periodo"])  # mês da origem só aparece na previsão
+
+    # Semana inicial incompleta (série começa no meio de um bloco de 7 dias) sai do histórico.
+    historico_semanal = agregar_historico(serie, "semana", previsao["data"].iloc[0])
+    assert not historico_semanal["parcial"].iloc[0]
+    assert historico_semanal["periodo"].iloc[-1] + pd.Timedelta(days=7) == previsao["data"].iloc[0]
+
+
+def test_simulate_treina_so_ate_o_corte(monkeypatch):
+    vistos = []
+    original = MODELOS["baseline_sazonal_7d"]
+
+    def espiao(treino, h):
+        vistos.append(treino.index[-1])
+        return original(treino, h)
+
+    monkeypatch.setitem(MODELOS, "baseline_sazonal_7d", espiao)
+    serie = _serie_semanal(220, ruido=1.0)
+    corte = serie.index[-29]
+    resultado = simulate(serie, corte, "baseline_sazonal_7d")
+    assert max(vistos) <= corte  # nem a previsão nem o backtest das faixas viram o futuro
+    assert resultado["previsao"]["data"].iloc[0] == corte + pd.Timedelta(days=1)
+    assert len(resultado["previsao"]) == 28
+    np.testing.assert_allclose(resultado["previsao"]["real"], serie.iloc[-28:])
+    assert resultado["wape"] == pytest.approx(metrics.wape(serie.iloc[-28:], resultado["previsao"]["previsto"]))
+    assert resultado["n_cortes_intervalo"] == 4
+    assert resultado["previsao"]["lim_inf_80"].notna().all()
+
+
+def test_simulate_treino_curto_usa_reserva_e_avisa():
+    serie = _serie_semanal(100, ruido=1.0)
+    resultado = simulate(serie, serie.index[61], "lightgbm")  # 62 dias de treino: LightGBM não roda
+    assert resultado["modelo"] == "holt_winters"
+    assert resultado["n_cortes_intervalo"] == 0
+    assert resultado["previsao"]["lim_inf_80"].isna().all()
+    assert any("LightGBM" in aviso or "lightgbm" in aviso for aviso in resultado["avisos"])
+    with pytest.raises(ValueError, match="28 dias"):
+        simulate(serie, serie.index[-10], "holt_winters")
+
+
+def test_summarize_b2b():
+    pedidos = _pedidos_limpos()
+    resumo = summarize_b2b(pedidos, "2025-08-01", "2025-08-04")
+    assert resumo["historico"] == {"pedidos": 1, "receita": 999.0, "inicio": "2025-08-03", "fim": "2025-08-03"}
+    assert resumo["janela"]["pedidos"] == 1
+    assert resumo["janela"]["participacao_receita"] == pytest.approx(999 / (100 + 50 + 999 + 30))
+    fora = summarize_b2b(pedidos, "2025-08-04", "2025-08-05")
+    assert fora["janela"]["pedidos"] == 0 and fora["janela"]["ticket_medio"] == 0.0
+
+
+def test_verificar_requisitos():
+    assert verificar_requisitos(_planilha_sintetica(30)) == []
+    faltando = verificar_requisitos(pd.DataFrame({"Produto": ["A"], "Status Venda": ["pago"]}))
+    assert len(faltando) == 2
+    assert any("Criado em" in item for item in faltando)
+    assert any("Valor Pago" in item for item in faltando)
+
+
+def test_pipeline_horizonte_previsao_maior_que_backtest():
+    resultado = run_predictive_pipeline(_planilha_sintetica(), "teste", alvos=("pedidos",), horizonte_previsao=90)
+    assert len(resultado["previsoes"]["pedidos"]) == 90
+    assert matriz_residuos(resultado["residuos"]["pedidos"]).shape == (4, 28)
+    assert resultado["metadados"]["horizonte"] == 28
+    assert "b2b" in resultado
+
+
 # ---------- planilha oficial (referências do CLAUDE.md) ----------
 
 @pytest.fixture(scope="module")
@@ -376,6 +528,23 @@ def test_planilha_wape_proximo_do_prototipo(resultado_planilha):
     assert tabela["baseline_sazonal_7d"] == pytest.approx(0.62, abs=0.03)
     assert tabela["media_movel_28d"] == pytest.approx(0.73, abs=0.03)
     assert resultado_planilha["metadados"]["alvos"]["receita"]["wape_vencedor"] <= tabela["holt_winters"]
+
+
+def test_planilha_resumo_b2b_numeros_de_conferencia(resultado_planilha):
+    b2b = resultado_planilha["b2b"]
+    assert b2b["historico"]["pedidos"] == 82
+    assert b2b["historico"]["receita"] == pytest.approx(88410.08, abs=0.005)
+    assert b2b["janela"]["pedidos"] == 23
+    assert b2b["janela"]["receita"] == pytest.approx(10891.08, abs=0.005)
+    assert b2b["janela"]["inicio"] == "2025-08-01" and b2b["janela"]["fim"] == "2026-04-06"
+
+
+def test_planilha_simulacao_no_ultimo_corte_permitido(resultado_planilha):
+    historico = resultado_planilha["historico"]["receita"]
+    serie = pd.Series(historico["real"].to_numpy(), index=pd.DatetimeIndex(historico["data"]))
+    resultado = simulate(serie, "2026-03-09", "holt_winters")
+    assert resultado["previsao"]["data"].iloc[-1] == pd.Timestamp("2026-04-06")
+    assert 0 < resultado["wape"] < 1
 
 
 def test_planilha_previsao_sem_negativos(resultado_planilha):

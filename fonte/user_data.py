@@ -58,6 +58,8 @@ def restore_user_session(user: dict):
     st.session_state["charts"] = []
     st.session_state["db_creds"] = get_user_config(user["user_id"]) or {}
     st.session_state["user_files"] = list_user_files(user["user_id"])
+    # Todo login começa no arquivo salvo; o banco de dados só é usado se o usuário trocar na barra lateral.
+    st.session_state["fonte_dados"] = "Arquivo CSV/Excel"
 
     if st.session_state["user_files"]:
         latest_file = _sort_by_timestamp(st.session_state["user_files"], "uploaded_at")[-1]

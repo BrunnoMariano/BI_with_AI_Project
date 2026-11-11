@@ -868,7 +868,7 @@ else:
         modelo_selecionado = st.session_state.get('modelo_selecionado', MODELO_PADRAO)
         if modelo_selecionado not in MODELOS:  # ex.: o4-mini, desligado pela OpenAI em 23/10/2026
             modelo_selecionado = MODELO_PADRAO
-        fonte_dados = st.session_state.get('fonte_dados', 'Banco de Dados')
+        fonte_dados = st.session_state.get('fonte_dados', 'Arquivo CSV/Excel')
         db_creds_saved = st.session_state.get('db_creds', {})
 
         if menu_selecionado == "Inteligência Artificial":

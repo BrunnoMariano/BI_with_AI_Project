@@ -49,6 +49,7 @@ def logout_user():
         "history",
         "charts",
         "db_creds",
+        "fonte_dados",
         "connected_uri",
         "schema_text",
         "schema_dict",

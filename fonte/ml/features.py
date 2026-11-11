@@ -45,6 +45,7 @@ def build_daily_series(
     inicio=None,
     excluir_b2b: bool = True,
     descartar_ultimo_dia: bool = True,
+    fim=None,
 ) -> pd.Series:
     """Série diária de pedidos pagos (contagem ou receita) por data_pedido.
 
@@ -52,7 +53,9 @@ def build_daily_series(
     - dias sem venda entram com 0 (índice diário contínuo, freq="D");
     - exclui B2B por padrão (decisão 3 do CLAUDE.md);
     - inicio=None detecta o primeiro mês com >= 100 pagos;
-    - descarta o último dia da extração, que está incompleto.
+    - descarta o último dia da extração, que está incompleto;
+    - fim (opcional) fixa o último dia da série; usado em recortes (ex.: um só produto)
+      para a série terminar no mesmo dia da base inteira.
     """
     if alvo not in ALVOS:
         raise ValueError(f"alvo deve ser um de {ALVOS}, recebido: {alvo!r}")
@@ -60,9 +63,12 @@ def build_daily_series(
     inicio = detect_training_start(df_clean, excluir_b2b=excluir_b2b) if inicio is None else pd.Timestamp(inicio)
     inicio = inicio.normalize()
 
-    # O último dia é o da extração inteira (qualquer status), não só dos pagos.
-    ultimo_dia = df_clean["data_pedido"].max().normalize()
-    fim = ultimo_dia - pd.Timedelta(days=1) if descartar_ultimo_dia else ultimo_dia
+    if fim is not None:
+        fim = pd.Timestamp(fim).normalize()
+    else:
+        # O último dia é o da extração inteira (qualquer status), não só dos pagos.
+        ultimo_dia = df_clean["data_pedido"].max().normalize()
+        fim = ultimo_dia - pd.Timedelta(days=1) if descartar_ultimo_dia else ultimo_dia
     if fim < inicio:
         raise ValueError(f"Período vazio: início {inicio.date()} depois do fim {fim.date()}.")
 
@@ -158,6 +164,43 @@ def summarize_b2b(df_clean: pd.DataFrame, inicio, fim) -> dict:
             "participacao_receita": float(janela["valor"].sum() / receita_total_janela) if receita_total_janela else 0.0,
         },
     }
+
+
+# Únicas variáveis do classificador de pagamento: todas conhecidas na criação do pedido.
+COLUNAS_PEDIDO = (
+    "produto", "cupom", "valor", "hora", "dia_semana", "is_b2b", "pedidos_anteriores", "tentativas_no_dia",
+)
+SEM_CUPOM = "sem_cupom"
+PRODUTO_DESCONHECIDO = "desconhecido"
+
+
+def build_order_features(df_clean: pd.DataFrame) -> pd.DataFrame:
+    """Variáveis de cada pedido conhecidas no momento da criação (exatamente COLUNAS_PEDIDO).
+
+    Monta a saída coluna a coluna para que nenhum campo preenchido no checkout entre por
+    acidente (decisão 8 do CLAUDE.md). pedidos_anteriores e tentativas_no_dia só olham
+    para trás: pedidos criados depois deste não contam. tentativas_no_dia começa em 1.
+    """
+    faltando = [c for c in ("data_pedido", "valor", "produto", "cupom", "cliente") if c not in df_clean]
+    if faltando:
+        raise ValueError("A base não tem as colunas necessárias para o modelo de pagamento: " + ", ".join(faltando))
+
+    criado = df_clean["data_pedido"]
+    # rank(method="min") - 1 = quantos pedidos do mesmo cliente são estritamente anteriores.
+    anteriores = criado.groupby(df_clean["cliente"]).rank(method="min") - 1
+    tentativas = criado.groupby([df_clean["cliente"], criado.dt.normalize()]).rank(method="min")
+
+    colunas = {
+        "produto": df_clean["produto"].fillna(PRODUTO_DESCONHECIDO),
+        "cupom": df_clean["cupom"].fillna(SEM_CUPOM),
+        "valor": df_clean["valor"].astype(float),
+        "hora": criado.dt.hour,
+        "dia_semana": criado.dt.dayofweek,
+        "is_b2b": df_clean["is_b2b"].astype(int),
+        "pedidos_anteriores": anteriores.fillna(0).astype(int),  # cliente vazio: sem histórico
+        "tentativas_no_dia": tentativas.fillna(1).astype(int),
+    }
+    return pd.DataFrame(colunas, index=df_clean.index)[list(COLUNAS_PEDIDO)]
 
 
 def calendar_features(datas) -> pd.DataFrame:

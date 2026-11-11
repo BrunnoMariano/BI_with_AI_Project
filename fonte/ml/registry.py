@@ -21,7 +21,7 @@ import pandas as pd
 PASTA_MODELOS = Path(__file__).resolve().parents[2] / "models"
 
 # Chaves do resultado que guardam {alvo: DataFrame}.
-CHAVES_TABELAS = ("previsoes", "modelos", "historico", "residuos")
+CHAVES_TABELAS = ("previsoes", "modelos", "historico", "residuos", "backtest")
 
 
 def chave_segura(source_key: str) -> str:

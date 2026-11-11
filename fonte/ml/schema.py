@@ -28,6 +28,7 @@ COLUMN_ALIASES: dict[str, list[str]] = {
     "cliente": ["Comprador"],
     "pagador": ["Nome Pagamento", "Pago por"],
     "conta": ["Conta"],
+    "link_pagamento": ["Link de pagamento"],
     "uf": ["Estado"],
     "cidade": ["Cidade"],
 }

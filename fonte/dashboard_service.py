@@ -10,13 +10,30 @@ import pandas as pd
 import pandasql as ps
 from sqlalchemy import create_engine, text
 
+from ml.forecasting import HORIZONTE_PADRAO, agregar_historico, agregar_previsao
+from ml.llm_utils import chat_params
+from ml.schema import COLUMN_ALIASES, detect_schema, normalize_column_label
 from user_data import get_dashboard_record, save_dashboard_record
 
 
 DASHBOARD_BREAKPOINT_COLS = {"lg": 24, "md": 12, "sm": 4}
 DASHBOARD_LAYOUT_DEFAULT = {"w": 8, "h": 6, "minW": 4, "minH": 4}
-DASHBOARD_VISUAL_TYPES = {"bar", "line", "area", "pie", "scatter", "table", "kpi"}
+DASHBOARD_VISUAL_TYPES = {"bar", "line", "area", "pie", "scatter", "table", "kpi", "forecast"}
 DASHBOARD_FILTER_MARKER = "/*DASHBOARD_FILTERS*/"
+
+# ---------- visual "Previsão" (forecast): lê o pipeline de ML, sem SQL do LLM ----------
+FORECAST_ALVOS = {"receita": "Receita", "pedidos": "Pedidos"}
+FORECAST_GRANULARIDADES = {"dia": "Dia", "semana": "Semana", "mes": "Mês"}
+FORECAST_HORIZONTES = (7, 14, 28, 90)
+FORECAST_DEFAULT_PARAMS = {"alvo": "receita", "granularidade": "dia", "horizonte": 28}
+# Filtros globais que refazem a previsão para o recorte (nomes canônicos de ml.schema).
+FORECAST_FILTER_FIELDS = ("produto", "cupom")
+# Quantos períodos de histórico aparecem antes da previsão.
+FORECAST_HISTORY_PERIODS = {"dia": 90, "semana": 26, "mes": 12}
+# Mesma paleta da aba Previsões (azul = real, laranja = previsão).
+FORECAST_COLOR_REAL = "#3987e5"
+FORECAST_COLOR_PREVISTO = "#d95926"
+FORECAST_COLOR_FAIXA_80 = "rgba(217, 89, 38, 0.30)"
 
 
 def build_source_descriptor(
@@ -111,8 +128,26 @@ def normalize_dashboard_items(items: list[dict[str, Any]] | None) -> list[dict[s
         visual_type = str(item_copy.get("visual_type", "bar")).lower().strip()
         item_copy["visual_type"] = visual_type if visual_type in DASHBOARD_VISUAL_TYPES else "bar"
         item_copy["filter_behavior"] = normalize_filter_behavior(item_copy.get("filter_behavior"))
+        if item_copy["visual_type"] == "forecast":
+            item_copy["forecast_params"] = normalize_forecast_params(item_copy.get("forecast_params"))
         normalized_items.append(item_copy)
     return normalized_items
+
+
+def normalize_forecast_params(params: dict[str, Any] | None) -> dict[str, Any]:
+    """Parâmetros do visual Previsão com valores válidos (alvo, granularidade, horizonte)."""
+    params = params or {}
+    alvo = str(params.get("alvo", "")).lower().strip()
+    granularidade = str(params.get("granularidade", "")).lower().strip()
+    try:
+        horizonte = int(params.get("horizonte", FORECAST_DEFAULT_PARAMS["horizonte"]))
+    except (TypeError, ValueError):
+        horizonte = FORECAST_DEFAULT_PARAMS["horizonte"]
+    return {
+        "alvo": alvo if alvo in FORECAST_ALVOS else FORECAST_DEFAULT_PARAMS["alvo"],
+        "granularidade": granularidade if granularidade in FORECAST_GRANULARIDADES else FORECAST_DEFAULT_PARAMS["granularidade"],
+        "horizonte": horizonte if horizonte in FORECAST_HORIZONTES else FORECAST_DEFAULT_PARAMS["horizonte"],
+    }
 
 
 def normalize_dashboard_filters(filters: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
@@ -448,8 +483,7 @@ def generate_visual_instructions(
     response = client.chat.completions.create(
         model=model_name,
         messages=messages,
-        temperature=1.0 if "o" in model_name else 0.0,
-        max_completion_tokens=900,
+        **chat_params(model_name, 0.0, 900),
     )
     return response.choices[0].message.content.strip()
 
@@ -733,6 +767,290 @@ def build_echarts_spec(df_result: pd.DataFrame, visual_spec: dict[str, Any]) -> 
     return {"render_mode": "echarts", "title": title, "option": option}
 
 
+# ---------- visual "Previsão" ----------
+
+FORECAST_FILTER_COLUMNS = {
+    normalize_column_label(alias) for campo in FORECAST_FILTER_FIELDS for alias in COLUMN_ALIASES[campo]
+}
+
+
+def default_forecast_title(params: dict[str, Any]) -> str:
+    params = normalize_forecast_params(params)
+    return f"Previsão de {FORECAST_ALVOS[params['alvo']].lower()} · próximos {params['horizonte']} dias"
+
+
+def _forecast_label(data: pd.Timestamp, granularidade: str) -> str:
+    return data.strftime("%m/%Y") if granularidade == "mes" else data.strftime("%d/%m/%y")
+
+
+def _round_or_none(valor: Any, casas: int = 2) -> float | None:
+    if valor is None or pd.isna(valor):
+        return None
+    return round(float(valor), casas)
+
+
+def build_forecast_spec(
+    resultado_pipeline: dict[str, Any],
+    alvo: str,
+    granularidade: str,
+    horizonte: int,
+    titulo: str = "",
+    avisos: list[str] | None = None,
+) -> dict[str, Any]:
+    """Option do ECharts do visual Previsão, a partir de ml.pipeline.run_predictive_pipeline.
+
+    Série "Real" (linha sólida), "Previsto" (tracejada, ligada ao último ponto real), faixa
+    de 80% (limite inferior transparente + diferença empilhada com área) e markLine vertical
+    em "hoje" (primeiro dia da previsão). Os números vêm só do pipeline, nunca do LLM.
+    """
+    params = normalize_forecast_params({"alvo": alvo, "granularidade": granularidade, "horizonte": horizonte})
+    alvo, granularidade, horizonte = params["alvo"], params["granularidade"], params["horizonte"]
+    avisos = list(avisos or [])
+
+    historico_df = resultado_pipeline["historico"][alvo]
+    historico = pd.Series(historico_df["real"].to_numpy(dtype=float), index=pd.DatetimeIndex(historico_df["data"]))
+    previsao = resultado_pipeline["previsoes"][alvo].iloc[:horizonte]
+    if previsao.empty:
+        return {"render_mode": "empty", "message": "Sem previsão para exibir."}
+    origem = pd.Timestamp(previsao["data"].iloc[0])
+
+    hist = agregar_historico(historico, granularidade, origem).tail(FORECAST_HISTORY_PERIODS[granularidade])
+    prev = agregar_previsao(previsao, resultado_pipeline["residuos"][alvo], granularidade, historico)
+    if granularidade != "dia" and len(prev) > 1 and bool(prev["parcial"].iloc[-1]):
+        # Último período incompleto (ex.: 5 dias de um mês) pareceria uma queda de vendas.
+        prev = prev.iloc[:-1]
+    if horizonte > HORIZONTE_PADRAO:
+        avisos.append(f"Acima de {HORIZONTE_PADRAO} dias a previsão não foi validada no backtest.")
+
+    rotulos_hist = [_forecast_label(d, granularidade) for d in hist["periodo"]]
+    rotulos_prev = [_forecast_label(d, granularidade) for d in prev["periodo"]]
+    vazio_hist = [None] * len(rotulos_hist)
+    vazio_prev = [None] * len(rotulos_prev)
+
+    real = [_round_or_none(v) for v in hist["real"]]
+    previsto = [_round_or_none(v) for v in prev["previsto"]]
+    # A linha prevista começa no último ponto real para não deixar buraco no gráfico.
+    previsto_serie = (vazio_hist[:-1] + [real[-1]] + previsto) if real else previsto
+    inferior = [_round_or_none(v) for v in prev["lim_inf_80"]]
+    superior = [_round_or_none(v) for v in prev["lim_sup_80"]]
+    largura = [None if i is None or s is None else round(max(s - i, 0.0), 2) for i, s in zip(inferior, superior)]
+
+    invisivel = {"opacity": 0}
+    sem_destaque = {"disabled": True}
+    series = [
+        {
+            "name": "Real",
+            "type": "line",
+            "data": real + vazio_prev,
+            "showSymbol": False,
+            "lineStyle": {"color": FORECAST_COLOR_REAL, "width": 2},
+            "itemStyle": {"color": FORECAST_COLOR_REAL},
+        },
+        {
+            "name": "Previsto",
+            "type": "line",
+            "data": previsto_serie,
+            "showSymbol": False,
+            "lineStyle": {"color": FORECAST_COLOR_PREVISTO, "width": 2, "type": "dashed"},
+            "itemStyle": {"color": FORECAST_COLOR_PREVISTO},
+            "markLine": {
+                "silent": True,
+                "symbol": ["none", "none"],
+                "lineStyle": {"color": "#b6c0cf", "type": "dotted", "width": 1},
+                "label": {
+                    "formatter": f"hoje · {origem.strftime('%d/%m/%Y')}",
+                    "position": "end",
+                    "color": "#b6c0cf",
+                },
+                "data": [{"xAxis": rotulos_prev[0]}],
+            },
+        },
+        # Faixa de 80%: limite inferior transparente + (superior - inferior) empilhado com área.
+        {
+            "name": "Faixa 80% (base)",
+            "type": "line",
+            "stack": "faixa_80",
+            "data": vazio_hist + inferior,
+            "showSymbol": False,
+            "lineStyle": invisivel,
+            "tooltip": {"show": False},
+            "emphasis": sem_destaque,
+            "silent": True,
+        },
+        {
+            "name": "Faixa de 80%",
+            "type": "line",
+            "stack": "faixa_80",
+            "data": vazio_hist + largura,
+            "showSymbol": False,
+            "lineStyle": invisivel,
+            "areaStyle": {"color": FORECAST_COLOR_FAIXA_80},
+            "itemStyle": {"color": FORECAST_COLOR_FAIXA_80},
+            "tooltip": {"show": False},
+            "emphasis": sem_destaque,
+            "silent": True,
+        },
+        # Invisíveis: só para o tooltip mostrar os limites (a série empilhada guarda a diferença).
+        {
+            "name": "Limite inferior 80%",
+            "type": "line",
+            "data": vazio_hist + inferior,
+            "showSymbol": False,
+            "lineStyle": invisivel,
+            "itemStyle": {"color": FORECAST_COLOR_PREVISTO},
+            "emphasis": sem_destaque,
+            "silent": True,
+        },
+        {
+            "name": "Limite superior 80%",
+            "type": "line",
+            "data": vazio_hist + superior,
+            "showSymbol": False,
+            "lineStyle": invisivel,
+            "itemStyle": {"color": FORECAST_COLOR_PREVISTO},
+            "emphasis": sem_destaque,
+            "silent": True,
+        },
+    ]
+
+    receita = alvo == "receita"
+    option = {
+        "backgroundColor": "transparent",
+        "tooltip": {"trigger": "axis"},
+        "legend": {
+            "top": 0,
+            "data": [
+                "Real",
+                "Previsto",
+                # A série da faixa tem linha invisível; o ícone precisa da cor da área.
+                {"name": "Faixa de 80%", "icon": "rect", "itemStyle": {"color": FORECAST_COLOR_FAIXA_80}},
+            ],
+            "textStyle": {"color": "#c7d1df"},
+        },
+        "grid": {"left": 16, "right": 24, "top": 54, "bottom": 44 if avisos else 24, "containLabel": True},
+        "xAxis": {
+            "type": "category",
+            "boundaryGap": False,
+            "data": rotulos_hist + rotulos_prev,
+            "axisLabel": {"color": "#aab7c9"},
+            "axisLine": {"lineStyle": {"color": "rgba(255,255,255,0.14)"}},
+        },
+        "yAxis": {
+            "type": "value",
+            "min": 0,
+            "name": "Receita (R$)" if receita else "Pedidos pagos",
+            "nameTextStyle": {"color": "#aab7c9"},
+            "axisLabel": {"color": "#aab7c9", "formatter": "R$ {value}" if receita else "{value}"},
+            "splitLine": {"lineStyle": {"color": "rgba(255,255,255,0.08)"}},
+        },
+        "series": series,
+    }
+    if avisos:
+        option["title"] = {
+            "text": "",
+            "subtext": "  ·  ".join(avisos),
+            "left": 0,
+            "bottom": 0,
+            "itemGap": 0,
+            "subtextStyle": {"color": "#f6d48b", "fontSize": 11},
+        }
+    return {
+        "render_mode": "echarts",
+        "title": titulo or default_forecast_title(params),
+        "option": option,
+        "avisos": avisos,
+    }
+
+
+def split_forecast_filters(filters: list[dict[str, Any]] | None) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Separa os filtros ativos em (refazem a previsão: Produto/Cupom, não se aplicam à previsão)."""
+    aplicaveis, ignorados = [], []
+    for dashboard_filter in normalize_dashboard_filters(filters):
+        if not dashboard_filter.get("selected_values"):
+            continue
+        if normalize_column_label(dashboard_filter["column"]) in FORECAST_FILTER_COLUMNS:
+            aplicaveis.append(dashboard_filter)
+        else:
+            ignorados.append(dashboard_filter)
+    return aplicaveis, ignorados
+
+
+def forecast_filter_key(filters: list[dict[str, Any]]) -> str:
+    """Chave estável do recorte (coluna + valores) para o cache da previsão; "" = base inteira."""
+    partes = sorted([item["column"], sorted(item["selected_values"])] for item in filters if item.get("selected_values"))
+    return json.dumps(partes, ensure_ascii=False) if partes else ""
+
+
+def _forecast_filter_notices(aplicaveis: list[dict[str, Any]], ignorados: list[dict[str, Any]]) -> list[str]:
+    avisos = []
+    if aplicaveis:
+        partes = []
+        for item in aplicaveis:
+            valores = item["selected_values"]
+            texto = ", ".join(valores[:3]) + (f" e mais {len(valores) - 3}" if len(valores) > 3 else "")
+            partes.append(f"{item['title']}: {texto}")
+        avisos.append("Previsão refeita para " + "; ".join(partes))
+    if len(ignorados) == 1:
+        avisos.append(f'O filtro "{ignorados[0]["title"]}" não se aplica à previsão')
+    elif ignorados:
+        nomes = ", ".join(f'"{item["title"]}"' for item in ignorados)
+        avisos.append(f"Os filtros {nomes} não se aplicam à previsão")
+    return avisos
+
+
+def build_forecast_render_spec(
+    item: dict[str, Any],
+    filters: list[dict[str, Any]],
+    db_mode: bool,
+    df_data: pd.DataFrame | None,
+    forecast_runner=None,
+) -> dict[str, Any]:
+    """Recalcula um visual Previsão: refaz a previsão no recorte de Produto/Cupom; avisa sobre os outros filtros.
+
+    `forecast_runner(df_recorte, chave_recorte)` devolve o resultado de run_predictive_pipeline
+    (com cache no app). Só vendas B2C pagas, por data de criação: regras do próprio pipeline.
+    """
+    if db_mode:
+        return {"render_mode": "error", "message": "A previsão funciona com arquivos de vendas (CSV/Excel), não com banco de dados."}
+    if forecast_runner is None or df_data is None:
+        return {"render_mode": "error", "message": "Previsão indisponível: selecione um arquivo de vendas."}
+    aplicaveis, ignorados = split_forecast_filters(filters)
+    df_recorte = apply_filters_to_dataframe(df_data, aplicaveis) if aplicaveis else df_data
+    resultado = forecast_runner(df_recorte, forecast_filter_key(aplicaveis))
+    params = normalize_forecast_params(item.get("forecast_params"))
+    return build_forecast_spec(
+        resultado,
+        params["alvo"],
+        params["granularidade"],
+        params["horizonte"],
+        titulo=item.get("title", ""),
+        avisos=_forecast_filter_notices(aplicaveis, ignorados),
+    )
+
+
+def build_forecast_item(
+    params: dict[str, Any],
+    title_override: str = "",
+    filter_behavior: dict[str, Any] | None = None,
+    chart_id: str | None = None,
+    layout: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Item de dashboard do tipo Previsão: guarda só os parâmetros (sem SQL); o gráfico é recalculado."""
+    params = normalize_forecast_params(params)
+    return {
+        "chart_id": chart_id or uuid4().hex,
+        "title": title_override.strip() if title_override and title_override.strip() else default_forecast_title(params),
+        "prompt": "",
+        "visual_type": "forecast",
+        "query_text": "",
+        "data_binding": {"dimension": "", "metric": "", "series": ""},
+        "forecast_params": params,
+        "echarts_spec": {},
+        "filter_behavior": normalize_filter_behavior(filter_behavior),
+        "layout": layout or {},
+    }
+
+
 def build_dashboard_item(
     prompt: str,
     visual_spec: dict[str, Any],
@@ -824,7 +1142,9 @@ def build_render_items(
     uri: str | None = None,
     df_data: pd.DataFrame | None = None,
     active_filters: list[dict[str, Any]] | None = None,
+    forecast_runner=None,
 ) -> list[dict[str, Any]]:
+    """Payload de cada visual para o canvas. `forecast_runner` é usado só pelos visuais Previsão."""
     items_to_render = []
     active_filters = normalize_dashboard_filters(active_filters if active_filters is not None else dashboard_record.get("filters", []))
     active_filter_selected = has_active_dashboard_filters(active_filters)
@@ -840,7 +1160,11 @@ def build_render_items(
             item_filters = [] if filter_behavior.get("ignore_global_filters") else active_filters
             query_text = item.get("query_text", "")
             stored_spec = item.get("echarts_spec")
-            if query_text:
+            if item.get("visual_type") == "forecast":
+                payload["render_spec"] = _json_safe(
+                    build_forecast_render_spec(item, item_filters, db_mode, df_data, forecast_runner)
+                )
+            elif query_text:
                 if db_mode:
                     query_text = apply_filters_to_sql_query(query_text, item_filters)
                     df_result = run_visual_query(query_text, db_mode=True, uri=uri, df_data=None)

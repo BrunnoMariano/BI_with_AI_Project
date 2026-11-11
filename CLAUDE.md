@@ -22,7 +22,7 @@ O autor está aprendendo programação. Ao final de cada tarefa, explique em lin
 | --- | --- | --- |
 | `fonte/appLAB.py` (~1.470 linhas) | App inteiro: login, sidebar, abas Conversa / Dashboard / Histórico, pipeline texto→SQL com retry, perfil do dataset (`detect_dataset_profile`, `build_dataset_profile`, `build_sql_system_prompt`) | Arquivo grande. Faça mudanças pontuais; lógica nova vai para `fonte/ml/` |
 | `fonte/forecast_tab.py` | Aba "Previsões" (Fase 3): KPIs, gráfico Plotly, simulação, tabela de modelos, B2B, CSV; `st.cache_data` por `file_id` | Só exibe; cálculos ficam em `fonte/ml/` |
-| `fonte/dashboard_service.py` | Visuais do dashboard (bar, line, area, pie, scatter, table, kpi), filtros globais, layouts, `build_echarts_spec`, `build_render_items` | O frontend repassa `option` direto ao ECharts |
+| `fonte/dashboard_service.py` | Visuais do dashboard (bar, line, area, pie, scatter, table, kpi, forecast), filtros globais, layouts, `build_echarts_spec`, `build_forecast_spec`, `build_render_items` | O frontend repassa `option` direto ao ECharts. O visual `forecast` ("Previsão") não usa SQL: lê o pipeline via `forecast_runner` (cache em `forecast_tab.obter_previsao_recorte`); só filtros de Produto/Cupom refazem a previsão |
 | `fonte/dashboard_canvas_component/` | Componente React + ECharts (`bundle.js` já compilado) | **Não recompilar nem editar `bundle.js`** |
 | `fonte/user_data.py` | Persistência do usuário: chat, arquivos, dashboards (Firestore `users/{uid}/...`) e leitura do arquivo (`load_dataframe_from_storage` usa `pd.read_excel`) | Reutilizar para salvar resultados de modelos |
 | `fonte/firebase_service.py` | REST do Firebase Auth, Firestore e Storage (`set_document`, `get_document`) | Não alterar a autenticação |
@@ -105,9 +105,9 @@ Marque `[x]` ao concluir cada fase.
 - [x] **Fase 1** — Esquema e limpeza (`schema.py`, `preprocessing.py`), perfil do dataset usando `detect_schema`.
 - [x] **Fase 2** — Previsão de vendas (`features.py`, `forecasting.py`, `metrics.py`, `registry.py`, `pipeline.py`) com backtest e intervalos de 80%/95%.
 - [x] **Fase 3** — Aba "Previsões" em `appLAB.py`: KPIs de 28 dias, gráfico real + previsto + faixa, seletores, tabela de modelos, modo simulação (data de corte escolhida → previsto × real), botão Retreinar, download CSV.
-- [ ] **Fase 4** — IA: intenção `forecast_query` em `classify_intent`, `explain_forecast`, resumo executivo automático, tabela `previsao` no pandasql.
-- [ ] **Fase 5** — Visual "Previsão" no Dashboard (`dashboard_service.py`), sem SQL do LLM.
-- [ ] **Fase 6** — Probabilidade de pagamento dos pendentes e alertas de anomalia.
+- [x] **Fase 4** — IA: intenção `forecast_query` em `classify_intent`, `explain_forecast`, resumo executivo automático, tabela `previsao` no pandasql. Lógica em `fonte/ml/explain.py` (JSON agregado enviado ao LLM) e `fonte/ml/llm_utils.py` (regra de temperatura).
+- [x] **Fase 5** — Visual "Previsão" no Dashboard (`dashboard_service.py`), sem SQL do LLM.
+- [x] **Fase 6** — Probabilidade de pagamento dos pendentes e alertas de anomalia (`conversion.py`, `anomaly.py`, seções "Pedidos pendentes" e "Alertas" na aba Previsões). No treino, pedido em aberto há mais de 14 dias conta como não pago; os mais recentes ficam de fora. O KPI principal da fila soma só os abertos há até 14 dias cujo comprador não tem outro pedido pago; a fila inteira aparece só na nota. `Link de pagamento` é etapa do funil: aparece na tabela, mas é proibido no modelo.
 
 Implemente uma fase por vez. Não adiante fases futuras sem pedido.
 
@@ -119,5 +119,5 @@ Implemente uma fase por vez. Não adiante fases futuras sem pedido.
 - Ao final de cada fase, confirme que `streamlit run fonte/appLAB.py` ainda abre sem erro e que o chat e o dashboard continuam funcionando.
 - Use `st.cache_data` para não retreinar a cada interação; retreino só ao trocar de arquivo ou clicar em "Retreinar".
 - Não altere login, Firebase Auth, `bundle.js` nem a conexão PostgreSQL.
-- Bug conhecido a corrigir na Fase 4: em `appLAB.py`, `temperature=1.0 if 'o' in model_name` deveria checar o prefixo do modelo (`model_name.startswith(("o1", "o3", "o4"))`).
+- Modelos da OpenAI: a lista do seletor e as regras de cada modelo ficam em `MODELOS` (`ml/llm_utils.py`; padrão `gpt-6.1-terra`). Toda chamada `client.chat.completions.create` usa `**chat_params(model, temperatura, max_tokens)`, que decide `temperature`, `reasoning_effort` e a folga de tokens (o GPT-6.1 Sol não aceita temperature). Para comparar modelos: `python scripts/comparar_modelos.py`.
 - Se algo no pedido contradizer este arquivo, pare e pergunte.

@@ -96,7 +96,8 @@ def clean_orders(df: pd.DataFrame) -> pd.DataFrame:
     - valor em float; data_pedido e data_pagamento em datetime;
     - status e forma_pagamento em minúsculas; cliente em minúsculas (chave do cliente);
     - promotora normalizada; conta vazia vira None;
-    - pago: status == "pago"; is_b2b: conta preenchida; valor_zero: valor == 0.
+    - pago: status == "pago"; is_b2b: conta preenchida; valor_zero: valor == 0;
+    - gerou_link (se a coluna existir): link de pagamento preenchido, sem ser "---".
     """
     orders = to_canonical(df)
 
@@ -120,4 +121,7 @@ def clean_orders(df: pd.DataFrame) -> pd.DataFrame:
     orders["pago"] = orders["status"].eq("pago") if "status" in orders else False
     orders["is_b2b"] = orders["conta"].notna() if "conta" in orders else False
     orders["valor_zero"] = orders["valor"].eq(0) if "valor" in orders else False
+    if "link_pagamento" in orders:
+        link = _clean_text(orders["link_pagamento"])
+        orders["gerou_link"] = link.notna() & ~link.fillna("").str.fullmatch(r"-+")
     return orders

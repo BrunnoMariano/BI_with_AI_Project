@@ -1,4 +1,6 @@
 # appLAB.py
+from contextlib import nullcontext
+
 import streamlit as st
 import pandas as pd
 import plotly.express as px
@@ -7,10 +9,16 @@ from sqlalchemy import create_engine, text
 from dashboard_canvas_component import dashboard_canvas_component
 from dashboard_service import (
     DASHBOARD_VISUAL_TYPES,
+    FORECAST_ALVOS,
+    FORECAST_DEFAULT_PARAMS,
+    FORECAST_GRANULARIDADES,
+    FORECAST_HORIZONTES,
     build_dashboard_item,
     build_dashboard_filter,
     build_echarts_spec,
+    build_forecast_item,
     build_render_items,
+    normalize_forecast_params,
     build_source_descriptor,
     delete_dashboard_filter,
     delete_dashboard_item,
@@ -45,7 +53,15 @@ from user_data import (
 )
 from ui_styles import inject_global_styles, render_app_hero, render_section_intro
 from ml.schema import SPECIALIZED_FILE_REQUIRED_COLUMNS, detect_dataset_profile
-from forecast_tab import render_forecast_tab
+from ml.llm_utils import MODELO_PADRAO, MODELOS, chat_params
+from ml.explain import (
+    INSTRUCOES_SQL_PREVISAO,
+    descrever_tabela_previsao,
+    explain_forecast,
+    parece_pergunta_de_previsao,
+    tabela_previsao,
+)
+from forecast_tab import obter_previsao_recorte, obter_resultado_previsao, render_forecast_tab
 
 st.set_page_config(page_title="Plataforma de Dados", page_icon="⚙️", layout="wide")
 inject_global_styles()
@@ -332,15 +348,21 @@ def build_sql_fix_prompt(error_text, sql_text, question, db_mode, profile):
 
 # --- FUNÇÕES DE IA ESPECIALIZADAS ---
 
+INTENT_CATEGORIES = ("data_query", "forecast_query", "schema_info", "schema_summary", "suggestion_request")
+
+
 def classify_intent(client, model_name, question, history_text, prompt_context=""):
-    """Classifica a intenção do usuário em uma de quatro categorias."""
+    """Classifica a intenção do usuário em uma de cinco categorias."""
     system_prompt = (
         "Classifique a intenção do usuário em UMA das categorias abaixo. "
         "Responda APENAS com o nome da categoria, sem explicação, sem aspas, sem pontuação.\n\n"
         "Categorias:\n"
-        "- data_query: Pedido de dados, totais, médias, filtros, listas, comparações. "
+        "- data_query: Pedido de dados JÁ REALIZADOS (passado), totais, médias, filtros, listas, comparações. "
         "Ex: 'qual o total de vendas?', 'quais produtos venderam mais?', 'mostre os dados de outubro', "
         "'tem dados de setembro?', 'quais foram os dados?', 'quanto vendeu em janeiro?'\n"
+        "- forecast_query: Pergunta sobre o FUTURO: previsão, projeção, quanto vai vender, metas. "
+        "Ex: 'quanto vou vender mês que vem?', 'previsão de receita', 'vamos bater a meta?', "
+        "'quantos pedidos teremos na próxima semana?', 'qual a projeção para maio?'\n"
         "- schema_info: Pedido sobre estrutura dos dados. "
         "Ex: 'quais colunas tem?', 'descreva a tabela X', 'quais tabelas existem?'\n"
         "- schema_summary: Pedido sobre contexto geral do banco. "
@@ -351,17 +373,21 @@ def classify_intent(client, model_name, question, history_text, prompt_context="
     )
     messages = [{"role": "system", "content": system_prompt},
                 {"role": "user", "content": f"Contexto disponível:\n{prompt_context or '(não informado)'}\n\nHistórico:\n{history_text}\n\nPergunta do usuário:\n{question}"}]
+    # Plano B se o LLM falhar ou responder fora das categorias: palavras de futuro -> forecast_query.
+    fallback = 'forecast_query' if parece_pergunta_de_previsao(question) else 'data_query'
     try:
-        resp = client.chat.completions.create(model=model_name, messages=messages, temperature=1.0 if 'o' in model_name else 0.0, max_completion_tokens=20)
-        return resp.choices[0].message.content.strip().lower().replace('`', '').strip()
+        # chat_params dá folga de tokens aos modelos que raciocinam (com só 20 a resposta viria vazia).
+        resp = client.chat.completions.create(model=model_name, messages=messages, **chat_params(model_name, 0.0, 20))
+        intent = (resp.choices[0].message.content or "").strip().lower().replace('`', '').strip()
+        return intent if any(category in intent for category in INTENT_CATEGORIES) else fallback
     except Exception:
-        return 'data_query'
+        return fallback
 
 
 def generate_sql(client, model_name, system_prompt, schema_text, history_text, question):
     messages = [{"role": "system", "content": system_prompt + "\n\n---\nEsquema:\n" + schema_text},
                 {"role": "user", "content": f"Histórico:\n{history_text or '(vazio)'}\n\nPergunta:\n{question}"}]
-    resp = client.chat.completions.create(model=model_name, messages=messages, temperature=1.0 if 'o' in model_name else 0.0, max_completion_tokens=1000)
+    resp = client.chat.completions.create(model=model_name, messages=messages, **chat_params(model_name, 0.0, 1000))
     return resp.choices[0].message.content.strip()
 
 
@@ -402,7 +428,7 @@ def generate_humanized_answer(client, model_name, question, df_result, profile=N
     else:
         system_prompt += "\nNUNCA inclua código SQL na resposta."
     messages = [{"role": "system", "content": system_prompt}, {"role": "user", "content": user_content}]
-    resp = client.chat.completions.create(model=model_name, messages=messages, temperature=1.0 if 'o' in model_name else 0.2, max_completion_tokens=600)
+    resp = client.chat.completions.create(model=model_name, messages=messages, **chat_params(model_name, 0.2, 600))
     return resp.choices[0].message.content.strip()
 
 
@@ -419,7 +445,7 @@ def generate_suggestions(client, model_name, schema_text, question, profile=None
         )
     messages = [{"role": "system", "content": system_prompt}, {"role": "user",
                                                                 "content": f"Pergunta do usuário: '{question}'\n\nEsquema dos dados:\n{schema_text}"}]
-    resp = client.chat.completions.create(model=model_name, messages=messages, temperature=1.0 if 'o' in model_name else 0.5, max_completion_tokens=300)
+    resp = client.chat.completions.create(model=model_name, messages=messages, **chat_params(model_name, 0.5, 300))
     return resp.choices[0].message.content.strip()
 
 
@@ -437,7 +463,7 @@ def generate_schema_summary(client, model_name, schema_text, question, profile=N
         )
     messages = [{"role": "system", "content": system_prompt}, {"role": "user",
                                                                 "content": f"Pergunta do usuário: '{question}'\n\nEsquema:\n{schema_text}"}]
-    resp = client.chat.completions.create(model=model_name, messages=messages, temperature=1.0 if 'o' in model_name else 0.3, max_completion_tokens=500)
+    resp = client.chat.completions.create(model=model_name, messages=messages, **chat_params(model_name, 0.3, 500))
     return resp.choices[0].message.content.strip()
 
 
@@ -455,7 +481,7 @@ def extract_table_name(client, model_name, question, schema_dict):
          "content": f"As tabelas disponíveis são:\n{table_list}\n\nPergunta do usuário: '{question}'\n\nNome da tabela mencionada:"}
     ]
     try:
-        resp = client.chat.completions.create(model=model_name, messages=messages, temperature=1.0 if 'o' in model_name else 0.0, max_completion_tokens=50)
+        resp = client.chat.completions.create(model=model_name, messages=messages, **chat_params(model_name, 0.0, 50))
         result = resp.choices[0].message.content.strip().lower().splitlines()[0]
         return result if result in schema_dict.keys() else 'NONE'
     except Exception:
@@ -525,7 +551,7 @@ def generate_chart_instructions(client, model_name, schema_text, question, db_mo
         )
     messages = [{"role": "system", "content": system_content}, {"role": "user",
                                                                 "content": f"Esquema:\n{schema_text}\n\nPreview:\n{preview_text}\n\nPedido:\n{question}"}]
-    resp = client.chat.completions.create(model=model_name, messages=messages, temperature=1.0 if 'o' in model_name else 0.0, max_completion_tokens=800)
+    resp = client.chat.completions.create(model=model_name, messages=messages, **chat_params(model_name, 0.0, 800))
     return resp.choices[0].message.content.strip()
 
 
@@ -631,14 +657,20 @@ def render_chart(chart_config):
         st.error(f"Erro ao gerar gráfico: {e}")
 
 
-def validate_sql_tables(sql_text, db_mode, schema_dict=None):
+def validate_sql_tables(sql_text, db_mode, schema_dict=None, extra_tables=()):
     if not sql_text: return False, "Consulta SQL vazia.", sql_text
-    
+    # Tabelas aceitas no modo arquivo: sempre 'df' e, se informado, 'previsao' (Fase 4).
+    allowed_tables = ["df"] + [t.lower() for t in extra_tables]
+
     if not db_mode:
-        # Regex mais robusta para pegar nomes de tabela com espaços, aspas ou nomes simples
-        sql_text = re.sub(r"(?i)\b(FROM|JOIN)\s+([\"'`][^\"'`]+[\"'`]|[\w]+)", r"\1 df", sql_text)
+        # Regex mais robusta para pegar nomes de tabela com espaços, aspas ou nomes simples;
+        # qualquer nome fora das tabelas aceitas vira 'df'.
+        def _normalize_table(match):
+            name = match.group(2).strip("\"'`").strip().lower()
+            return f"{match.group(1)} {name if name in allowed_tables else 'df'}"
+        sql_text = re.sub(r"(?i)\b(FROM|JOIN)\s+([\"'`][^\"'`]+[\"'`]|[\w]+)", _normalize_table, sql_text)
         # Garantia final: Se por algum motivo o regex falhou e não temos 'FROM df', forçamos uma substituição básica
-        if "from df" not in sql_text.lower():
+        if not any(f"from {t}" in sql_text.lower() for t in allowed_tables):
             sql_text = re.sub(r"(?i)\bFROM\s+[\s\w\"'`]+", "FROM df", sql_text)
         
     sql_lower = sql_text.lower()
@@ -649,7 +681,8 @@ def validate_sql_tables(sql_text, db_mode, schema_dict=None):
         if not found: return False, f"Tabela não encontrada. Disponíveis: {', '.join(available)}", sql_text
         return True, None, sql_text
     else:
-        if re.search(r"\bfrom\s+[`'\"]?df[`'\"]?\b", sql_lower): return True, None, sql_text
+        tables_pattern = "|".join(re.escape(t) for t in allowed_tables)
+        if re.search(r"\bfrom\s+[`'\"]?(" + tables_pattern + r")[`'\"]?\b", sql_lower): return True, None, sql_text
         return False, "Erro na tabela para pandasql.", sql_text
 
 
@@ -666,6 +699,7 @@ VISUAL_TYPE_LABELS = {
     "scatter": "Dispersão",
     "table": "Tabela",
     "kpi": "KPI",
+    "forecast": "Previsão",
 }
 VISUAL_TYPE_BY_LABEL = {label: value for value, label in VISUAL_TYPE_LABELS.items()}
 
@@ -694,6 +728,7 @@ def set_dashboard_editor(mode="create", item=None):
         "title": item.get("title", "") if item else "",
         "visual_type": item.get("visual_type", "bar") if item else "bar",
         "ignore_global_filters": bool(filter_behavior.get("ignore_global_filters", False)),
+        "forecast_params": normalize_forecast_params(item.get("forecast_params") if item else None),
     }
 
 
@@ -731,6 +766,10 @@ def apply_dashboard_editor_pending():
         "Barras",
     )
     st.session_state["dashboard_form_ignore_filters"] = pending.get("ignore_global_filters", False)
+    forecast_params = normalize_forecast_params(pending.get("forecast_params"))
+    st.session_state["dashboard_form_forecast_alvo"] = forecast_params["alvo"]
+    st.session_state["dashboard_form_forecast_granularidade"] = forecast_params["granularidade"]
+    st.session_state["dashboard_form_forecast_horizonte"] = forecast_params["horizonte"]
 
 
 def build_dashboard_visual_item(
@@ -821,16 +860,14 @@ else:
         st.divider()
 
         # Modelos
-        model_options = {
-            "o4-mini (Recomendado - Rápido)": "o4-mini",
-            "GPT-5.4 (Máximo Desempenho)": "gpt-5.4",
-            "o3 (Especialista em Lógica)": "o3",
-            "GPT-5.4-mini (Alta Performance)": "gpt-5.4-mini"
-        }
+        # Rótulo -> ID; a lista e as regras de cada modelo ficam em ml/llm_utils.py.
+        model_options = {config["rotulo"]: model_id for model_id, config in MODELOS.items()}
         
         # Recuperar estado atual
         openai_api_key = st.session_state.get('openai_api_key', '')
-        modelo_selecionado = st.session_state.get('modelo_selecionado', 'o4-mini')
+        modelo_selecionado = st.session_state.get('modelo_selecionado', MODELO_PADRAO)
+        if modelo_selecionado not in MODELOS:  # ex.: o4-mini, desligado pela OpenAI em 23/10/2026
+            modelo_selecionado = MODELO_PADRAO
         fonte_dados = st.session_state.get('fonte_dados', 'Banco de Dados')
         db_creds_saved = st.session_state.get('db_creds', {})
 
@@ -1067,7 +1104,32 @@ else:
                         final_text = "";
                         response_handled_internally = False
 
-                        if 'schema_summary' in intent:
+                        # Previsão do arquivo atual (vem do cache da aba Previsões; None se não for base de vendas).
+                        forecast_result = None
+                        forecast_table = None
+                        if not db_mode and df_data is not None:
+                            loaded_file_id = st.session_state.get("loaded_file_id")
+                            loaded_file = next((f for f in st.session_state.get("user_files", []) if f["file_id"] == loaded_file_id), None)
+                            if loaded_file is not None:
+                                forecast_result = obter_resultado_previsao(loaded_file_id, loaded_file, df_data)
+                        if forecast_result is not None:
+                            forecast_table = tabela_previsao(forecast_result)
+
+                        if 'forecast_query' in intent:
+                            if forecast_result is None:
+                                final_text = (
+                                    "Ainda não consigo responder perguntas sobre o futuro com esta fonte de dados. "
+                                    "As previsões funcionam com arquivos de vendas (com data de criação, status e valor "
+                                    "dos pedidos). Veja os detalhes na aba **Previsões**."
+                                )
+                            else:
+                                try:
+                                    # "\$": sem isso o Markdown trata "R$ 10 a R$ 20" como fórmula matemática.
+                                    final_text = explain_forecast(client, modelo_selecionado, prompt, forecast_result).replace("$", "\\$")
+                                except Exception as e:
+                                    final_text = "Desculpe, não consegui explicar a previsão agora. Os números estão na aba **Previsões**."
+                                    st.caption(f"Detalhe técnico: {e}")
+                        elif 'schema_summary' in intent:
                             final_text = generate_schema_summary(client, modelo_selecionado, schema_text, prompt, current_profile)
                         elif 'schema_info' in intent:
                             current_schema_dict = st.session_state.get('schema_dict', {}) if db_mode else schema_dict
@@ -1081,14 +1143,22 @@ else:
                             final_text = generate_suggestions(client, modelo_selecionado, schema_text, prompt, current_profile)
                         else:  # intent == 'data_query'
                             system_prompt = build_sql_system_prompt(db_mode, current_profile)
-                            sql_candidate = generate_sql(client, modelo_selecionado, system_prompt, schema_text,
+                            sql_schema_text = schema_text
+                            sql_tables = {"df": df_data}
+                            if forecast_table is not None:
+                                # Tabela "previsao" ao lado de "df" no pandasql.
+                                system_prompt += INSTRUCOES_SQL_PREVISAO
+                                sql_schema_text = schema_text + "\n\n" + descrever_tabela_previsao(forecast_table)
+                                sql_tables["previsao"] = forecast_table
+                            extra_tables = tuple(t for t in sql_tables if t != "df")
+                            sql_candidate = generate_sql(client, modelo_selecionado, system_prompt, sql_schema_text,
                                                          history_text, prompt)
                             sql_text = extract_sql(sql_candidate)
                             if not sql_text or "NO_SQL" in sql_candidate.upper():
                                 final_text = generate_suggestions(client, modelo_selecionado, schema_text, prompt, current_profile)
                             else:
                                 schema_dict_ctx = st.session_state.get('schema_dict', {}) if db_mode else schema_dict
-                                ok, vmsg, sql_text = validate_sql_tables(sql_text, db_mode, schema_dict_ctx)
+                                ok, vmsg, sql_text = validate_sql_tables(sql_text, db_mode, schema_dict_ctx, extra_tables)
                                 if not ok:
                                     final_text = f"Não consegui gerar uma consulta válida para sua pergunta. Tente reformular de forma mais específica."
                                 else:
@@ -1103,7 +1173,7 @@ else:
                                                 engine = create_engine(uri)
                                                 df_result = pd.read_sql(text(sql_text), engine)
                                             else:
-                                                df_result = ps.sqldf(sql_text, {"df": df_data})
+                                                df_result = ps.sqldf(sql_text, sql_tables)
                                             sql_succeeded = True
                                             break
                                         except Exception as e:
@@ -1111,9 +1181,9 @@ else:
                                             if attempt < max_retries - 1:
                                                 fix_prompt = build_sql_fix_prompt(str(e), sql_text, prompt, db_mode, current_profile)
                                                 sql_candidate = generate_sql(client, modelo_selecionado, system_prompt,
-                                                                             schema_text, "", fix_prompt)
+                                                                             sql_schema_text, "", fix_prompt)
                                                 sql_text = extract_sql(sql_candidate)
-                                                ok, vmsg, sql_text = validate_sql_tables(sql_text, db_mode, schema_dict_ctx)
+                                                ok, vmsg, sql_text = validate_sql_tables(sql_text, db_mode, schema_dict_ctx, extra_tables)
                                                 if not ok:
                                                     sql_succeeded = False
                                                     break
@@ -1214,13 +1284,22 @@ else:
             column_options = build_dashboard_column_options(schema_dict_ctx, db_mode_dash, df_data_ctx)
             dashboard_filters = dashboard_record.get("filters", [])
 
-            render_items = build_render_items(
-                dashboard_record,
-                db_mode_dash,
-                uri=uri_ctx,
-                df_data=df_data_ctx,
-                active_filters=dashboard_record.get("filters", []),
-            )
+            # Visuais "Previsão": leem o pipeline de ML (com cache), não SQL do LLM.
+            forecast_runner = None
+            if not db_mode_dash and selected_file_ctx is not None:
+                def forecast_runner(df_recorte, chave_recorte):
+                    return obter_previsao_recorte(selected_file_id, selected_file_ctx, df_recorte, chave_recorte)
+
+            has_forecast_items = any(item.get("visual_type") == "forecast" for item in dashboard_record.get("items", []))
+            with st.spinner("Calculando a previsão do dashboard...") if has_forecast_items else nullcontext():
+                render_items = build_render_items(
+                    dashboard_record,
+                    db_mode_dash,
+                    uri=uri_ctx,
+                    df_data=df_data_ctx,
+                    active_filters=dashboard_record.get("filters", []),
+                    forecast_runner=forecast_runner,
+                )
 
             toolbar_cols = st.columns([1.15, 1, 1, 1.2, 1.65])
             with toolbar_cols[0]:
@@ -1290,13 +1369,15 @@ else:
                     ):
                         dashboard_record = update_dashboard_filter_values(dashboard_record, next_filter_values)
                         save_dashboard(user.get("user_id", ""), source_descriptor["source_key"], dashboard_record)
-                        render_items = build_render_items(
-                            dashboard_record,
-                            db_mode_dash,
-                            uri=uri_ctx,
-                            df_data=df_data_ctx,
-                            active_filters=dashboard_record.get("filters", []),
-                        )
+                        with st.spinner("Recalculando a previsão para o recorte...") if has_forecast_items else nullcontext():
+                            render_items = build_render_items(
+                                dashboard_record,
+                                db_mode_dash,
+                                uri=uri_ctx,
+                                df_data=df_data_ctx,
+                                active_filters=dashboard_record.get("filters", []),
+                                forecast_runner=forecast_runner,
+                            )
 
                 canvas_event = dashboard_canvas_component(
                     items=render_items,
@@ -1365,30 +1446,100 @@ else:
                     )
                     st.caption("Escolha o tipo, descreva o conteúdo e o visual será criado diretamente no canvas.")
 
+                # Fora do form: trocar o tipo precisa redesenhar os campos (prompt x seletores da previsão).
+                visual_type_labels = list(VISUAL_TYPE_BY_LABEL.keys())
+                current_visual_type = st.session_state.get("dashboard_form_visual_type", "bar")
+                current_visual_label = VISUAL_TYPE_LABELS.get(current_visual_type, "Barras")
+                selected_visual_label = st.selectbox(
+                    "Tipo do visual",
+                    visual_type_labels,
+                    index=visual_type_labels.index(current_visual_label) if current_visual_label in visual_type_labels else 0,
+                    key="dashboard_form_visual_type_label",
+                )
+                is_forecast_visual = VISUAL_TYPE_BY_LABEL.get(selected_visual_label) == "forecast"
+
                 with st.form("dashboard_visual_form"):
-                    visual_type_labels = list(VISUAL_TYPE_BY_LABEL.keys())
-                    current_visual_type = st.session_state.get("dashboard_form_visual_type", "bar")
-                    current_visual_label = VISUAL_TYPE_LABELS.get(current_visual_type, "Barras")
-                    selected_visual_label = st.selectbox(
-                        "Tipo do visual",
-                        visual_type_labels,
-                        index=visual_type_labels.index(current_visual_label) if current_visual_label in visual_type_labels else 0,
-                        key="dashboard_form_visual_type_label",
-                    )
                     st.text_input("Título do visual", key="dashboard_form_title")
-                    st.text_area(
-                        "Prompt do visual",
-                        key="dashboard_form_prompt",
-                        height=180,
-                        placeholder="Ex.: compare o faturamento por mês",
-                    )
+                    if is_forecast_visual:
+                        # O Streamlit apaga o valor de campos não exibidos; volta ao padrão (ex.: 28 dias).
+                        for forecast_field in ("alvo", "granularidade", "horizonte"):
+                            forecast_key = f"dashboard_form_forecast_{forecast_field}"
+                            if forecast_key not in st.session_state:
+                                st.session_state[forecast_key] = FORECAST_DEFAULT_PARAMS[forecast_field]
+                        st.caption(
+                            "Real + previsão das vendas B2C pagas (por data de criação do pedido), com faixa de 80%. "
+                            "Os números vêm do modelo de previsão, sem SQL gerado pela IA."
+                        )
+                        st.selectbox(
+                            "Alvo",
+                            list(FORECAST_ALVOS),
+                            format_func=FORECAST_ALVOS.get,
+                            key="dashboard_form_forecast_alvo",
+                        )
+                        st.selectbox(
+                            "Granularidade",
+                            list(FORECAST_GRANULARIDADES),
+                            format_func=FORECAST_GRANULARIDADES.get,
+                            key="dashboard_form_forecast_granularidade",
+                        )
+                        st.selectbox(
+                            "Horizonte (dias)",
+                            list(FORECAST_HORIZONTES),
+                            key="dashboard_form_forecast_horizonte",
+                        )
+                    else:
+                        st.text_area(
+                            "Prompt do visual",
+                            key="dashboard_form_prompt",
+                            height=180,
+                            placeholder="Ex.: compare o faturamento por mês",
+                        )
                     ignore_global_filters = st.checkbox(
                         "Ignorar filtros globais neste visual",
                         key="dashboard_form_ignore_filters",
+                        help="Na Previsão, só os filtros de Produto e Cupom refazem a previsão; os demais são ignorados com aviso." if is_forecast_visual else None,
                     )
                     submitted = st.form_submit_button("Atualizar visual" if editor_mode == "edit" else "Gerar visual")
 
-                if submitted:
+                if submitted and is_forecast_visual:
+                    title_override = st.session_state.get("dashboard_form_title", "").strip()
+                    forecast_params = normalize_forecast_params(
+                        {
+                            "alvo": st.session_state.get("dashboard_form_forecast_alvo", FORECAST_DEFAULT_PARAMS["alvo"]),
+                            "granularidade": st.session_state.get("dashboard_form_forecast_granularidade", FORECAST_DEFAULT_PARAMS["granularidade"]),
+                            "horizonte": st.session_state.get("dashboard_form_forecast_horizonte", FORECAST_DEFAULT_PARAMS["horizonte"]),
+                        }
+                    )
+                    if db_mode_dash:
+                        st.warning("A previsão funciona com arquivos de vendas. Em Conexão de Dados, escolha \"Arquivo CSV/Excel\".")
+                    elif selected_file_ctx is None or df_data_ctx is None:
+                        st.warning("Selecione um arquivo de vendas para criar a previsão.")
+                    else:
+                        with st.spinner("Calculando a previsão..."):
+                            try:
+                                # Valida antes de salvar: o arquivo precisa permitir a previsão.
+                                obter_previsao_recorte(selected_file_id, selected_file_ctx, df_data_ctx)
+                                new_item = build_forecast_item(
+                                    forecast_params,
+                                    title_override=title_override,
+                                    filter_behavior={"ignore_global_filters": bool(ignore_global_filters)},
+                                )
+                                if editor_mode == "edit" and current_item:
+                                    new_item["chart_id"] = current_item["chart_id"]
+                                    new_item["layout"] = current_item.get("layout", {})
+                                dashboard_record = upsert_dashboard_item(dashboard_record, new_item)
+                                save_dashboard(user.get("user_id", ""), source_descriptor["source_key"], dashboard_record)
+                                clear_dashboard_layout_draft(source_descriptor["source_key"])
+                                set_dashboard_editor("edit", new_item)
+                                st.session_state["dashboard_feedback"] = {
+                                    "type": "success",
+                                    "message": "Visual de previsão salvo e sincronizado com o canvas.",
+                                }
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Erro ao montar a previsão: {e}")
+
+                elif submitted:
                     form_prompt = st.session_state.get("dashboard_form_prompt", "").strip()
                     title_override = st.session_state.get("dashboard_form_title", "").strip()
                     forced_visual_type = VISUAL_TYPE_BY_LABEL.get(selected_visual_label, "bar")
@@ -1503,4 +1654,4 @@ else:
                 st.rerun()
 
     with tab4:
-        render_forecast_tab(fonte_dados)
+        render_forecast_tab(fonte_dados, openai_api_key, modelo_selecionado)

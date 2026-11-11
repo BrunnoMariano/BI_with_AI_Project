@@ -60,3 +60,23 @@ def cobertura(real, lim_inf, lim_sup) -> float:
     if len(y) == 0:
         return float("nan")
     return float(np.mean((y >= lo) & (y <= hi)))
+
+
+def auc(real, probabilidade) -> float:
+    """Área sob a curva ROC: chance de um positivo receber nota maior que um negativo (0,5 = acaso)."""
+    from sklearn.metrics import roc_auc_score
+
+    y, p = _arrays(real, probabilidade)
+    if len(np.unique(y)) < 2:
+        return float("nan")
+    return float(roc_auc_score(y, p))
+
+
+def precisao_media(real, probabilidade) -> float:
+    """Precisão média (área sob a curva precisão x revocação); o acaso vale a taxa de positivos."""
+    from sklearn.metrics import average_precision_score
+
+    y, p = _arrays(real, probabilidade)
+    if len(np.unique(y)) < 2:
+        return float("nan")
+    return float(average_precision_score(y, p))

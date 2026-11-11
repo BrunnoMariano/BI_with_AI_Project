@@ -69,7 +69,24 @@ Docs/
 # Dados do cliente (LGPD) e modelos treinados
 # ------------------------------
 data/
+models/
 *.xlsx
 *.xls
 *.csv
 *.joblib
+*.pkl
+*.parquet
+
+# ------------------------------
+# Credenciais de serviço (ex.: Firebase service account)
+# ------------------------------
+*serviceAccount*.json
+*-firebase-adminsdk-*.json
+credentials*.json
+
+# ------------------------------
+# IDE / ferramentas locais
+# ------------------------------
+.vscode/
+.idea/
+.claude/

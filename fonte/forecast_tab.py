@@ -9,9 +9,15 @@ from __future__ import annotations
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
+from openai import OpenAI
 
+from ml.anomaly import detect_anomalies
+from ml.conversion import score_pending, train_conversion
+from ml.explain import gerar_resumo_executivo, resultado_tem_previsao
 from ml.forecasting import agregar_historico, agregar_previsao, simulate, total_com_intervalo
+from ml.llm_utils import MODELO_PADRAO
 from ml.pipeline import run_predictive_pipeline, verificar_requisitos
+from ml.preprocessing import clean_orders
 from ui_styles import render_section_intro
 from user_data import load_dataframe_from_storage
 
@@ -25,13 +31,38 @@ NOMES_MODELOS = {
     "lightgbm": "LightGBM",
     "baseline_sazonal_7d": "Baseline sazonal (7 dias)",
     "media_movel_28d": "Média móvel (28 dias)",
+    "regressao_logistica": "Regressão logística",
 }
+NOMES_VARIAVEIS = {
+    "produto": "Produto",
+    "cupom": "Cupom",
+    "valor": "Valor",
+    "hora": "Hora da criação",
+    "dia_semana": "Dia da semana da criação",
+    "is_b2b": "Venda corporativa (B2B)",
+    "pedidos_anteriores": "Pedidos anteriores do comprador",
+    "tentativas_no_dia": "Tentativas no mesmo dia",
+}
+COLUNAS_PENDENTES = {
+    "pedido_id": "Pedido",
+    "data_pedido": "Criado em",
+    "idade_dias": "Em aberto há (dias)",
+    "status": "Status",
+    "gerou_link": "Link de pagamento",
+    "produto": "Produto",
+    "valor": "Valor",
+    "probabilidade": "Probabilidade de pagar",
+    "receita_esperada": "Receita esperada",
+}
+ROTULOS_DIRECAO = {"acima": "▲ Acima", "abaixo": "▼ Abaixo"}
 
 # Paleta validada para fundo escuro (dataviz: azul = real, laranja = previsão).
 COR_REAL = "#3987e5"
 COR_PREVISTO = "#d95926"
 FAIXA_80 = "rgba(217, 89, 38, 0.30)"
 FAIXA_95 = "rgba(217, 89, 38, 0.14)"
+COR_ALERTA = "#fab219"  # status "atenção": distinto das séries; a direção vem do formato do marcador
+COR_ANEL_MARCADOR = "#0d1117"
 COR_TEXTO = "#eef2f7"
 COR_TEXTO_SECUNDARIO = "#b6c0cf"
 COR_GRADE = "rgba(255,255,255,0.06)"
@@ -127,6 +158,57 @@ def tabela_csv(previsao_agregada: pd.DataFrame, alvo: str, granularidade: str) -
         }
     )
     return tabela.to_csv(index=False, sep=";", decimal=",").encode("utf-8-sig")
+
+
+def tabela_pendentes(fila: pd.DataFrame) -> pd.DataFrame:
+    """Fila de pendentes com os nomes de coluna da tela, na ordem recebida (maior probabilidade primeiro)."""
+    tabela = fila[[c for c in COLUNAS_PENDENTES if c in fila]].rename(columns=COLUNAS_PENDENTES)
+    if "Link de pagamento" in tabela:
+        tabela["Link de pagamento"] = tabela["Link de pagamento"].map({True: "Sim", False: "Não"})
+    return tabela
+
+
+def tabela_avaliacao(treino: dict) -> pd.DataFrame:
+    """Comparação dos classificadores no corte temporal, com o vencedor marcado."""
+    comparacao = treino["comparacao"]
+    return pd.DataFrame(
+        {
+            "Modelo": [
+                NOMES_MODELOS.get(m, m) + (" ★ vencedor" if m == treino["vencedor"] else "") for m in comparacao["modelo"]
+            ],
+            "AUC": comparacao["auc"].to_numpy(),
+            "Precisão média": comparacao["precisao_media"].to_numpy(),
+        }
+    )
+
+
+def tabela_importancia(treino: dict) -> pd.DataFrame:
+    """Importância das variáveis com nomes legíveis, da maior para a menor."""
+    importancia = treino["importancia"]
+    return pd.DataFrame(
+        {
+            "Variável": importancia["variavel"].map(lambda v: NOMES_VARIAVEIS.get(v, v)).to_numpy(),
+            "Queda no AUC ao embaralhar": importancia["importancia"].to_numpy(),
+        }
+    )
+
+
+def tabela_alertas(anomalias: pd.DataFrame, alvo: str) -> pd.DataFrame:
+    """Só os dias anômalos, do mais recente para o mais antigo, com textos prontos para a tela."""
+    dias = anomalias[anomalias["anomalia"]].sort_values("data", ascending=False)
+    return pd.DataFrame(
+        {
+            "Dia": _rotulo_periodo(dias["data"], "dia"),
+            "Direção": dias["direcao"].map(ROTULOS_DIRECAO).to_numpy(),
+            "Real": [formatar_valor(v, alvo) for v in dias["real"]],
+            "Previsto": [formatar_valor(v, alvo) for v in dias["previsto"]],
+            "Faixa de 95%": [
+                f"{formatar_valor(a, alvo)} a {formatar_valor(b, alvo)}"
+                for a, b in zip(dias["lim_inf_95"], dias["lim_sup_95"])
+            ],
+            "Desvio": [formatar_pct(v / 100, sinal=True, casas=0) for v in dias["desvio_pct"]],
+        }
+    )
 
 
 # ---------- gráficos ----------
@@ -289,6 +371,47 @@ def construir_grafico_simulacao(historico: pd.Series, simulacao: dict, alvo: str
     return _layout(fig, alvo)
 
 
+def construir_grafico_anomalias(anomalias: pd.DataFrame, alvo: str) -> go.Figure:
+    """Backtest: real, previsto e faixa de 95%, com triângulos nos dias fora da faixa."""
+    fig = go.Figure()
+    _faixa(fig, anomalias["data"], anomalias["lim_inf_95"], anomalias["lim_sup_95"], FAIXA_95, "Faixa de 95%", 5)
+    fig.add_trace(
+        go.Scatter(
+            x=anomalias["data"], y=anomalias["previsto"], mode="lines", name="Previsto no backtest", legendrank=2,
+            line={"color": COR_PREVISTO, "width": 2, "dash": "dash"},
+            customdata=[
+                f"{formatar_valor(a, alvo)} a {formatar_valor(b, alvo)}"
+                for a, b in zip(anomalias["lim_inf_95"], anomalias["lim_sup_95"])
+            ],
+            hovertemplate="Previsto: " + _hover_valor(alvo) + "<br>Faixa 95%: %{customdata}<extra></extra>",
+        )
+    )
+    fig.add_trace(
+        go.Scatter(
+            x=anomalias["data"], y=anomalias["real"], mode="lines", name="Real", legendrank=1,
+            line={"color": COR_REAL, "width": 2},
+            customdata=_rotulo_periodo(anomalias["data"], "dia"),
+            hovertemplate="%{customdata}<br>Real: " + _hover_valor(alvo) + "<extra></extra>",
+        )
+    )
+    for direcao, simbolo, nome, ordem in (
+        ("acima", "triangle-up", "Acima da faixa", 3),
+        ("abaixo", "triangle-down", "Abaixo da faixa", 4),
+    ):
+        dias = anomalias[anomalias["direcao"] == direcao]
+        if dias.empty:
+            continue
+        fig.add_trace(
+            go.Scatter(
+                x=dias["data"], y=dias["real"], mode="markers", name=nome, legendrank=ordem,
+                marker={"symbol": simbolo, "size": 13, "color": COR_ALERTA, "line": {"color": COR_ANEL_MARCADOR, "width": 2}},
+                customdata=[formatar_pct(v / 100, sinal=True, casas=0) for v in dias["desvio_pct"]],
+                hovertemplate=nome + ": %{customdata} vs previsto<extra></extra>",
+            )
+        )
+    return _layout(fig, alvo)
+
+
 # ---------- cache (retreina só ao trocar de arquivo ou clicar em Retreinar) ----------
 
 @st.cache_data(show_spinner=False, max_entries=8)
@@ -302,6 +425,66 @@ def _rodar_pipeline(file_id: str, versao: int, _registro_arquivo: dict, _df: pd.
         return run_predictive_pipeline(df, file_id, horizonte_previsao=HORIZONTE_MAXIMO)
     except ValueError as erro:
         return {"erro": str(erro)}
+
+
+def obter_resultado_previsao(file_id: str, registro_arquivo: dict, df: pd.DataFrame | None = None) -> dict | None:
+    """Resultado do pipeline (do cache) para o arquivo, na mesma versão da aba Previsões.
+
+    Usado pelo chat. Devolve None se o arquivo não for uma base de pedidos ou se a previsão falhar.
+    """
+    versao = st.session_state.get("forecast_versions", {}).get(file_id, 0)
+    if df is None and st.session_state.get("loaded_file_id") == file_id:
+        df = st.session_state.get("df_data")
+    try:
+        resultado = _rodar_pipeline(file_id, versao, registro_arquivo, df)
+    except Exception:
+        return None
+    return resultado if resultado_tem_previsao(resultado) else None
+
+
+@st.cache_data(show_spinner=False, max_entries=32)
+def _rodar_pipeline_recorte(file_id: str, versao: int, chave_recorte: str, inicio: str, fim: str, _df: pd.DataFrame) -> dict:
+    """Previsão de um recorte (ex.: um produto), com as mesmas datas de treino da base inteira.
+
+    Erros também ficam no cache, para não retreinar a cada clique num recorte que não dá para prever.
+    """
+    try:
+        return run_predictive_pipeline(_df, f"file:{file_id}|{chave_recorte}", inicio=inicio, fim=fim,
+                                       horizonte_previsao=HORIZONTE_MAXIMO)
+    except ValueError as erro:
+        return {"erro": str(erro)}
+
+
+def obter_previsao_recorte(file_id: str, registro_arquivo: dict, df_recorte: pd.DataFrame, chave_recorte: str = "") -> dict:
+    """Resultado do pipeline para o Dashboard: base inteira (chave vazia) ou recorte filtrado.
+
+    O recorte usa o início e o fim do treino da base inteira, então a previsão sempre parte
+    do mesmo "hoje". Levanta ValueError com mensagem em português se não der para prever.
+    """
+    base = obter_resultado_previsao(file_id, registro_arquivo)
+    if base is None:
+        raise ValueError("Este arquivo não permite gerar previsão (precisa ser uma base de pedidos com data, status e valor).")
+    if not chave_recorte:
+        return base
+    meta = base["metadados"]["alvos"]["receita"]
+    versao = st.session_state.get("forecast_versions", {}).get(file_id, 0)
+    resultado = _rodar_pipeline_recorte(file_id, versao, chave_recorte, meta["inicio_treino"], meta["fim_treino"], df_recorte)
+    if "erro" in resultado:
+        raise ValueError(f"Não foi possível prever para este recorte: {resultado['erro']}")
+    return resultado
+
+
+@st.cache_data(show_spinner=False, max_entries=8)
+def _rodar_conversao(file_id: str, versao: int, _registro_arquivo: dict, _df: pd.DataFrame | None) -> dict:
+    """Treina o classificador e pontua a fila (inteira, recentes e recuperáveis) uma vez por (arquivo, versão)."""
+    df = _df if _df is not None else load_dataframe_from_storage(_registro_arquivo)
+    try:
+        pedidos = clean_orders(df)
+        treino = train_conversion(pedidos)
+        fila = score_pending(pedidos, treino)
+    except ValueError as erro:
+        return {"erro": str(erro)}
+    return {"treino": {chave: valor for chave, valor in treino.items() if chave != "modelo"}, "fila": fila}
 
 
 @st.cache_data(show_spinner=False, max_entries=64)
@@ -324,6 +507,33 @@ def _aviso_fonte_generica(resultado: dict) -> None:
         f"Para prever, a base precisa ter:\n{itens}\n\n"
         f"Colunas encontradas no arquivo: {colunas}."
     )
+
+
+def _render_resumo_executivo(resultado: dict, file_id: str, versao: int, openai_api_key: str, modelo: str) -> None:
+    """Resumo de 3 frases escrito pela IA, gerado uma vez por arquivo (e a cada Retreinar)."""
+    resumos = st.session_state.setdefault("forecast_summaries", {})
+    chave = f"{file_id}:{versao}"
+    with st.container(border=True):
+        st.markdown("**Resumo executivo**")
+        if chave not in resumos:
+            if not openai_api_key:
+                st.caption("Informe a chave da OpenAI na barra lateral para gerar o resumo automático.")
+                return
+            with st.spinner("Escrevendo o resumo executivo..."):
+                try:
+                    resumos[chave] = {"texto": gerar_resumo_executivo(OpenAI(api_key=openai_api_key), modelo, resultado)}
+                except Exception as erro:
+                    # Guarda o erro para não chamar a API de novo a cada clique na tela.
+                    resumos[chave] = {"erro": str(erro)}
+        resumo = resumos[chave]
+        if "erro" in resumo:
+            st.warning(f"Não foi possível gerar o resumo executivo: {resumo['erro']}")
+        else:
+            st.markdown(resumo["texto"].replace("$", "\\$"))
+            _caption("Escrito pela IA usando apenas os números calculados pelo modelo (os mesmos dos indicadores abaixo).")
+        if st.button("Gerar resumo de novo", key="prev_resumo_novo"):
+            resumos.pop(chave, None)
+            st.rerun()
 
 
 def _render_kpis(resultado: dict) -> None:
@@ -475,7 +685,98 @@ def _render_simulacao(resultado: dict, file_id: str, versao: int, alvo: str) -> 
         st.info(aviso)
 
 
-def render_forecast_tab(fonte_dados: str) -> None:
+def _render_avaliacao_conversao(treino: dict) -> None:
+    validacao = treino["validacao"]
+    with st.expander("Como o modelo de pagamento foi avaliado"):
+        col_modelos, col_variaveis = st.columns(2)
+        with col_modelos:
+            avaliacao = tabela_avaliacao(treino).style.format({"AUC": lambda v: formatar_numero(v, 3), "Precisão média": lambda v: formatar_numero(v, 3)})
+            st.dataframe(avaliacao, hide_index=True, use_container_width=True)
+        with col_variaveis:
+            importancia = tabela_importancia(treino).style.format({"Queda no AUC ao embaralhar": lambda v: formatar_numero(v, 3)})
+            st.dataframe(importancia, hide_index=True, use_container_width=True)
+        _caption(
+            f"Treinado com os {formatar_numero(validacao['n_treino'])} pedidos mais antigos e testado nos "
+            f"{formatar_numero(validacao['n_teste'])} mais recentes (a partir de {formatar_data(validacao['inicio_teste'])}). "
+            "AUC: 0,5 é acaso e 1,0 é perfeito. Precisão média: quanto os pedidos com nota alta de fato pagaram "
+            f"(o acaso daria {formatar_numero(validacao['taxa_pago_teste'], 3)}). "
+            "Usa só o que se sabe na criação do pedido; dados preenchidos no checkout ficam de fora."
+        )
+
+
+def _render_pendentes(file_id: str, versao: int, registro: dict, df: pd.DataFrame | None) -> None:
+    with st.container(border=True):
+        st.markdown("**Pedidos pendentes**")
+        with st.spinner("Calculando a probabilidade de pagamento..."):
+            try:
+                conversao = _rodar_conversao(file_id, versao, registro, df)
+            except Exception as erro:
+                st.warning(f"Não foi possível calcular a probabilidade de pagamento: {erro}")
+                return
+        if "erro" in conversao:
+            st.info(f"A probabilidade de pagamento não está disponível para este arquivo: {conversao['erro']}")
+            return
+
+        treino, fila = conversao["treino"], conversao["fila"]
+        dias_resolucao = treino["validacao"]["dias_resolucao"]
+        recentes, recuperaveis = fila["recentes"], fila["recuperaveis"]
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric(f"Receita esperada · abertos há até {dias_resolucao} dias", formatar_brl(recuperaveis["receita_esperada"]),
+                      help="Soma de valor × probabilidade de pagamento dos pedidos recentes, sem as tentativas abandonadas.")
+            _caption(f"{formatar_numero(recuperaveis['n_pedidos'])} pedidos · {formatar_brl(recuperaveis['valor_em_aberto'])} em aberto")
+        with col2:
+            st.metric("AUC do modelo", formatar_numero(treino["auc"], 2), help="Medido nos pedidos mais recentes, que o modelo não viu no treino.")
+            _caption(f"{NOMES_MODELOS.get(treino['vencedor'], treino['vencedor'])} · precisão média {formatar_numero(treino['precisao_media'], 2)}")
+
+        _caption(
+            f"Ficaram fora do indicador {formatar_numero(recentes['n_abandonadas'])} dos {formatar_numero(recentes['n_pedidos'])} "
+            "pedidos recentes: o comprador já tem outro pedido pago, então são tentativas abandonadas. "
+            f"Fila inteira: {formatar_brl(fila['receita_esperada'])} esperados em {formatar_numero(fila['n_pedidos'])} pedidos "
+            f"({formatar_brl(fila['valor_em_aberto'])} em aberto). Esse total está inflado: a probabilidade usa o que se sabia na "
+            f"criação do pedido e não considera há quanto tempo ele está parado, e pedidos em aberto há mais de {dias_resolucao} dias "
+            "raramente são pagos."
+        )
+        if fila["n_pedidos"]:
+            tabela = tabela_pendentes(fila["pedidos"]).style.format(
+                {
+                    "Pedido": str,
+                    "Criado em": formatar_data,
+                    "Valor": lambda v: formatar_brl(v, 2),
+                    "Probabilidade de pagar": lambda v: formatar_pct(v, casas=0),
+                    "Receita esperada": lambda v: formatar_brl(v, 2),
+                },
+                na_rep="–",
+            )
+            st.dataframe(tabela, hide_index=True, use_container_width=True)
+        else:
+            st.info("Não há pedidos pendentes nem aguardando pagamento neste arquivo.")
+        _render_avaliacao_conversao(treino)
+
+
+def _render_alertas(resultado: dict, alvo: str) -> None:
+    with st.container(border=True):
+        st.markdown(f"**Alertas · {ALVOS[alvo].lower()}**")
+        if "backtest" not in resultado:  # resultado em cache de antes da Fase 6
+            st.info("Clique em Retreinar para calcular os alertas deste arquivo.")
+            return
+        anomalias = detect_anomalies(serie_historica(resultado, alvo), resultado["backtest"][alvo])
+        n_anomalias = int(anomalias["anomalia"].sum())
+        n_acima = int((anomalias["direcao"] == "acima").sum())
+        total = len(anomalias)
+        _caption(
+            f"{n_anomalias} de {total} dias ficaram fora da faixa de 95% prevista no backtest "
+            f"({n_acima} acima e {n_anomalias - n_acima} abaixo). Mesmo sem nada de errado, cerca de "
+            f"{formatar_numero(total * 0.05)} dias ficariam fora por acaso. O desvio compara o real com o previsto."
+        )
+        st.plotly_chart(construir_grafico_anomalias(anomalias, alvo), use_container_width=True)
+        if n_anomalias:
+            st.dataframe(tabela_alertas(anomalias, alvo), hide_index=True, use_container_width=True)
+        else:
+            st.info("Nenhum dia ficou fora da faixa de 95% no período do backtest.")
+
+
+def render_forecast_tab(fonte_dados: str, openai_api_key: str = "", modelo: str = MODELO_PADRAO) -> None:
     """Desenha a aba Previsões para o arquivo selecionado na barra lateral."""
     render_section_intro(
         "Previsões",
@@ -522,6 +823,7 @@ def render_forecast_tab(fonte_dados: str) -> None:
         versoes[file_id] = versao + 1
         st.rerun()
 
+    _render_resumo_executivo(resultado, file_id, versao, openai_api_key, modelo)
     _render_kpis(resultado)
 
     c1, c2, c3, c4 = st.columns([1.2, 1.4, 1.4, 1.4])
@@ -540,3 +842,5 @@ def render_forecast_tab(fonte_dados: str) -> None:
     st.markdown(f"**Comparação de modelos · {ALVOS[alvo].lower()}** (vencedor: {vencedor})")
     _render_tabela_modelos(resultado, alvo)
     _render_b2b(resultado)
+    _render_pendentes(file_id, versao, registro, df)
+    _render_alertas(resultado, alvo)

@@ -278,6 +278,23 @@ def backtest(
     }
 
 
+def faixas_backtest(resultado_backtest: dict, modelo: str) -> pd.DataFrame:
+    """Real x previsto de cada dia do backtest de `modelo`, com faixas de 80%/95%.
+
+    Cada corte usa só os resíduos dos OUTROS cortes (mesma regra da cobertura), para o
+    dia não ser julgado por uma faixa construída com o próprio erro.
+    Colunas: data, corte, real, previsto, lim_inf_80, lim_sup_80, lim_inf_95, lim_sup_95.
+    """
+    previsoes = resultado_backtest["previsoes"]
+    matriz = resultado_backtest["residuos"][modelo]
+    partes = []
+    for corte, parte in previsoes[previsoes["modelo"] == modelo].groupby("corte"):
+        outros = np.delete(matriz, corte - 1, axis=0) if matriz.shape[0] > 1 else matriz
+        previsto = parte["previsto"].to_numpy()
+        partes.append(parte[["data", "corte", "real", "previsto"]].assign(**intervalos(previsto, outros)))
+    return pd.concat(partes, ignore_index=True)
+
+
 # ---------- previsão final ----------
 
 def forecast(

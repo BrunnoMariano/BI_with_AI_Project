@@ -12,11 +12,11 @@ import pandas as pd
 
 from ml import registry
 from ml.features import ALVOS, build_daily_series, detect_training_start, summarize_b2b
-from ml.forecasting import HORIZONTE_PADRAO, N_CORTES_PADRAO, fit_best, residuos_longos
+from ml.forecasting import HORIZONTE_PADRAO, N_CORTES_PADRAO, faixas_backtest, fit_best, residuos_longos
 from ml.preprocessing import clean_orders
 from ml.schema import COLUMN_ALIASES, detect_schema
 
-VERSAO_PIPELINE = "fase3_v1"
+VERSAO_PIPELINE = "fase6_v1"
 COLUNAS_NECESSARIAS = ("data_pedido", "status", "valor")
 DESCRICAO_COLUNAS = {
     "data_pedido": "data de criação do pedido",
@@ -43,6 +43,7 @@ def run_predictive_pipeline(
     n_cortes: int = N_CORTES_PADRAO,
     alvos=ALVOS,
     inicio=None,
+    fim=None,
     horizonte_previsao: int | None = None,
     salvar: bool = False,
     uid: str | None = None,
@@ -55,11 +56,14 @@ def run_predictive_pipeline(
     - "modelos": {alvo: tabela do backtest, média dos cortes, ordenada por WAPE};
     - "historico": {alvo: DataFrame data, real} usado no treino;
     - "residuos": {alvo: DataFrame corte, passo, residuo} do vencedor no backtest (base das faixas);
+    - "backtest": {alvo: DataFrame real x previsto do vencedor em cada dia do backtest, com faixas};
     - "b2b": resumo descritivo das vendas corporativas (não entram na previsão);
     - "metadados": datas de treino, n_obs, modelo vencedor, cortes do backtest etc.
 
     O backtest sempre usa `horizonte` (28 dias); `horizonte_previsao` permite prever mais
     dias (ex.: 90) com o mesmo modelo. Com salvar=True grava via registry.
+    `inicio`/`fim` fixam a janela da série (usado ao prever um recorte, ex.: um produto,
+    com as mesmas datas da base inteira).
     """
     faltando = verificar_requisitos(df_raw)
     if faltando:
@@ -69,9 +73,9 @@ def run_predictive_pipeline(
     pedidos = clean_orders(df_raw)
     inicio = detect_training_start(pedidos) if inicio is None else pd.Timestamp(inicio)
 
-    previsoes, modelos, historico, residuos, meta_alvos = {}, {}, {}, {}, {}
+    previsoes, modelos, historico, residuos, faixas, meta_alvos = {}, {}, {}, {}, {}, {}
     for alvo in alvos:
-        serie = build_daily_series(pedidos, alvo=alvo, inicio=inicio)
+        serie = build_daily_series(pedidos, alvo=alvo, inicio=inicio, fim=fim)
         ajuste = fit_best(serie, horizonte=horizonte, n_cortes=n_cortes)
         previsao = ajuste.forecast(horizonte_previsao)
 
@@ -79,6 +83,7 @@ def run_predictive_pipeline(
         modelos[alvo] = ajuste.tabela
         historico[alvo] = pd.DataFrame({"data": serie.index, "real": serie.to_numpy()})
         residuos[alvo] = residuos_longos(ajuste.residuos)
+        faixas[alvo] = faixas_backtest(ajuste.backtest, ajuste.modelo)
         meta_alvos[alvo] = {
             "modelo_vencedor": ajuste.modelo,
             "wape_vencedor": float(ajuste.tabela.iloc[0]["wape"]),
@@ -107,6 +112,7 @@ def run_predictive_pipeline(
         "modelos": modelos,
         "historico": historico,
         "residuos": residuos,
+        "backtest": faixas,
         "b2b": summarize_b2b(pedidos, serie.index[0], serie.index[-1]),
         "metadados": {
             "versao": VERSAO_PIPELINE,
